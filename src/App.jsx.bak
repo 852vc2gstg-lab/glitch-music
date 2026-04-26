@@ -1,0 +1,3910 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
+import { createPortal } from 'react-dom'
+import {
+  Check,
+  FileUp,
+  Edit3,
+  SlidersHorizontal,
+  Forward,
+  ArrowUp,
+  Heart,
+  ImageIcon,
+  Repeat,
+  ListMusic,
+  Link2,
+  MoreVertical,
+  Pause,
+  Play,
+  Plus,
+  Shuffle,
+  Rewind,
+  Save,
+  Trash2,
+  Upload,
+  Youtube,
+  UserRound,
+  Volume2,
+  Maximize2,
+  Minimize2,
+  X,
+} from 'lucide-react'
+import './App.css'
+
+const gradients = [
+  'linear-gradient(135deg, #ff8a65 0%, #ff5e7a 100%)',
+  'linear-gradient(135deg, #2dd4bf 0%, #60a5fa 100%)',
+  'linear-gradient(135deg, #8b5cf6 0%, #ec4899 100%)',
+  'linear-gradient(135deg, #f59e0b 0%, #f97316 100%)',
+  'linear-gradient(135deg, #10b981 0%, #22c55e 100%)',
+]
+
+const playlistColors = [
+  '#ef4444',
+  '#f97316',
+  '#eab308',
+  '#84cc16',
+  '#22c55e',
+  '#10b981',
+  '#14b8a6',
+  '#06b6d4',
+  '#0ea5e9',
+  '#3b82f6',
+  '#6366f1',
+  '#8b5cf6',
+  '#a855f7',
+  '#d946ef',
+  '#ec4899',
+  '#f43f5e',
+  '#fb7185',
+  '#fb923c',
+  '#f59e0b',
+  '#4ade80',
+]
+
+const equalizerBands = [
+  { key: 'bass', label: 'Bas', type: 'lowshelf', frequency: 110, q: 0.7 },
+  { key: 'lowMid', label: 'Alt', type: 'peaking', frequency: 340, q: 1.0 },
+  { key: 'mid', label: 'Orta', type: 'peaking', frequency: 1200, q: 1.0 },
+  { key: 'highMid', label: 'Net', type: 'peaking', frequency: 3200, q: 1.0 },
+  { key: 'treble', label: 'Tiz', type: 'highshelf', frequency: 10500, q: 0.7 },
+]
+
+const DB_NAME = 'nova-player-db'
+const DB_VERSION = 1
+const STORE_NAME = 'tracks'
+const UI_KEY = 'nova-player-ui'
+const PLAYLISTS_KEY = 'nova-player-playlists'
+const ARTIST_FACTS_KEY = 'nova-player-artist-facts'
+const FAVORITES_KEY = 'nova-player-favorites'
+const DRIVE_MANIFEST_URL = import.meta.env.VITE_DRIVE_MANIFEST_URL?.trim() || ''
+const appLogo = `${import.meta.env.BASE_URL}logo.png`
+
+const formatTime = (value) => {
+  if (!Number.isFinite(value) || value < 0) {
+    return '0:00'
+  }
+
+  const minutes = Math.floor(value / 60)
+  const seconds = Math.floor(value % 60)
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`
+}
+
+const getTrackSortValue = (track, fallbackIndex = 0) =>
+  Number.isFinite(track?.order)
+    ? track.order
+    : Number.isFinite(track?.createdAt)
+      ? track.createdAt
+      : fallbackIndex
+
+const sortTracksByOrder = (list) =>
+  list
+    .map((track, index) => ({ track, index }))
+    .sort(
+      (left, right) =>
+        getTrackSortValue(left.track, left.index) - getTrackSortValue(right.track, right.index),
+    )
+    .map(({ track }) => track)
+
+const parseTrackName = (fileName) => {
+  const cleanName = fileName.replace(/\.[^/.]+$/, '')
+  const parts = cleanName.split(' - ')
+
+  if (parts.length >= 2) {
+    return {
+      artist: parts[0],
+      title: parts.slice(1).join(' - '),
+    }
+  }
+
+  return {
+    artist: 'Yerel Koleksiyon',
+    title: cleanName,
+  }
+}
+
+const readDuration = (url) =>
+  new Promise((resolve) => {
+    const probe = document.createElement('audio')
+    const finalize = (duration = 0) => {
+      probe.src = ''
+      resolve(duration)
+    }
+
+    probe.preload = 'metadata'
+    probe.onloadedmetadata = () => finalize(probe.duration)
+    probe.onerror = () => finalize(0)
+    probe.src = url
+  })
+
+const formatWikiDate = (value) => {
+  if (!value) {
+    return ''
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return ''
+  }
+
+  return new Intl.DateTimeFormat('tr-TR', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  }).format(date)
+}
+
+const hexToRgba = (hex, alpha) => {
+  const normalized = hex.replace('#', '')
+  const expanded = normalized.length === 3
+    ? normalized.split('').map((char) => char + char).join('')
+    : normalized
+
+  if (expanded.length !== 6) {
+    return `rgba(255, 255, 255, ${alpha})`
+  }
+
+  const value = Number.parseInt(expanded, 16)
+  const r = (value >> 16) & 255
+  const g = (value >> 8) & 255
+  const b = value & 255
+
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`
+}
+
+const normalizeArtistQuery = (value) =>
+  value
+    .replace(/\s*\((feat\.?|ft\.?|with|remix|live|official).*$/i, '')
+    .replace(/\s*(feat\.?|ft\.?|with|x|vs\.)\s+.*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+const readTrackMetadata = async (file) => {
+  try {
+    const { parseBlob } = await import('music-metadata-browser')
+    const metadata = await parseBlob(file)
+    const title = metadata?.common?.title?.trim() || ''
+    const artist =
+      metadata?.common?.artists?.filter(Boolean).join(', ')?.trim() ||
+      metadata?.common?.artist?.trim() ||
+      ''
+
+    return {
+      title,
+      artist,
+    }
+  } catch {
+    return null
+  }
+}
+
+const pickGradient = (seed = '') => {
+  const value = seed.split('').reduce((sum, char) => sum + char.charCodeAt(0), 0)
+  return gradients[Math.abs(value) % gradients.length]
+}
+
+const normalizeDriveUrl = (value = '') => {
+  const url = value.trim()
+  if (!url) {
+    return ''
+  }
+
+  const fileMatch = url.match(/drive\.google\.com\/file\/d\/([^/]+)/i)
+  if (fileMatch?.[1]) {
+    return `https://drive.google.com/uc?export=download&id=${fileMatch[1]}`
+  }
+
+  const openMatch = url.match(/[?&]id=([^&]+)/i)
+  if (url.includes('drive.google.com') && openMatch?.[1]) {
+    return `https://drive.google.com/uc?export=download&id=${openMatch[1]}`
+  }
+
+  return url
+}
+
+const normalizeDriveTrack = (track) => {
+  const rawId = track.id || track.driveId || track.audioUrl || `${track.title || 'track'}-${track.artist || 'artist'}`
+  const normalizedId = `drive:${encodeURIComponent(String(rawId))}`
+
+  return {
+    ...track,
+    id: normalizedId,
+    source: 'drive',
+    audioUrl: normalizeDriveUrl(track.audioUrl || ''),
+    coverUrl: normalizeDriveUrl(track.coverUrl || ''),
+    gradient: track.gradient || pickGradient(track.id || track.title || track.artist || ''),
+  }
+}
+
+const fetchRemoteCoverArt = async (title, artist) => {
+  const searchTerms = Array.from(
+    new Set([
+      `${artist} ${title}`.trim(),
+      `${title} ${artist}`.trim(),
+      artist.trim(),
+      title.trim(),
+    ].filter(Boolean)),
+  )
+
+  for (const term of searchTerms) {
+    const response = await fetch(
+      `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=music&entity=song&limit=5`,
+    )
+    if (!response.ok) {
+      continue
+    }
+
+    const json = await response.json()
+    const results = Array.isArray(json?.results) ? json.results : []
+    const match = results.find((item) => item?.artworkUrl100)
+    if (match?.artworkUrl100) {
+      return match.artworkUrl100.replace(/100x100bb\./, '300x300bb.')
+    }
+  }
+
+  return ''
+}
+
+const upgradeCoverUrl = (url = '', size = '100x100bb') => {
+  if (!url) {
+    return ''
+  }
+
+  return url.replace(/\/\d+x\d+bb\./, `/${size}.`).replace(/100x100bb\./, `${size}.`)
+}
+
+const getTrackDisplayUrl = (track, mode = 'thumb', pendingCover = null) => {
+  const url = pendingCover?.coverUrl || track?.coverUrl || track?.coverRemoteUrl || ''
+  if (!url) {
+    return ''
+  }
+
+  if (url.includes('itunes.apple.com') || url.includes('mzstatic.com')) {
+    return upgradeCoverUrl(url, mode === 'hero' ? '600x600bb' : '100x100bb')
+  }
+
+  return url
+}
+
+const getTrackCoverUrl = (track, pendingCover = null) =>
+  getTrackDisplayUrl(track, 'hero', pendingCover)
+
+const getTrackSignature = (track) => {
+  const title = normalizeArtistQuery(track?.title || '').toLowerCase()
+  const artist = normalizeArtistQuery(track?.artist || '').toLowerCase()
+  const size = track?.size || ''
+  const durationBucket = Number.isFinite(track?.duration) ? Math.round(track.duration) : ''
+  const sourceKey =
+    track?.source === 'link' ? normalizeDriveUrl(track?.audioUrl || '') : ''
+  return `${title}|${artist}|${size}|${durationBucket}|${sourceKey}`
+}
+
+const loadImageElement = (src) =>
+  new Promise((resolve, reject) => {
+    const image = new Image()
+    image.onload = () => resolve(image)
+    image.onerror = () => reject(new Error('image-load-failed'))
+    image.src = src
+  })
+
+const readFileAsDataUrl = (file) =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(new Error('file-read-failed'))
+    reader.readAsDataURL(file)
+  })
+
+const extractDominantColor = async (src) => {
+  if (!src) {
+    return ''
+  }
+
+  let objectUrl = src
+  let shouldRevoke = false
+
+  try {
+    if (!src.startsWith('blob:') && !src.startsWith('data:')) {
+      const response = await fetch(src)
+      if (!response.ok) {
+        return ''
+      }
+
+      const blob = await response.blob()
+      objectUrl = URL.createObjectURL(blob)
+      shouldRevoke = true
+    }
+
+    const image = await loadImageElement(objectUrl)
+    const canvas = document.createElement('canvas')
+    const size = 24
+    canvas.width = size
+    canvas.height = size
+    const context = canvas.getContext('2d')
+    if (!context) {
+      return ''
+    }
+
+    context.drawImage(image, 0, 0, size, size)
+    const { data } = context.getImageData(0, 0, size, size)
+    const buckets = new Map()
+
+    for (let index = 0; index < data.length; index += 4) {
+      const alpha = data[index + 3]
+      if (alpha < 180) {
+        continue
+      }
+
+      const r = data[index]
+      const g = data[index + 1]
+      const b = data[index + 2]
+      const key = `${Math.round(r / 16) * 16},${Math.round(g / 16) * 16},${Math.round(b / 16) * 16}`
+      buckets.set(key, (buckets.get(key) || 0) + 1)
+    }
+
+    let dominant = ''
+    let dominantCount = 0
+    buckets.forEach((count, key) => {
+      if (count > dominantCount) {
+        dominant = key
+        dominantCount = count
+      }
+    })
+
+    if (!dominant) {
+      return ''
+    }
+
+    const [r, g, b] = dominant.split(',').map(Number)
+    return `rgb(${r}, ${g}, ${b})`
+  } catch {
+    return ''
+  } finally {
+    if (shouldRevoke) {
+      URL.revokeObjectURL(objectUrl)
+    }
+  }
+}
+
+const getReadableCoverColors = (background) => {
+  const match = background.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/i)
+  if (!match) {
+    return {
+      fg: '#ffffff',
+      fgSoft: 'rgba(255, 255, 255, 0.72)',
+      fgMuted: 'rgba(255, 255, 255, 0.58)',
+    }
+  }
+
+  const [r, g, b] = match.slice(1).map(Number)
+  const brightness = (r * 299 + g * 587 + b * 114) / 1000
+
+  if (brightness >= 180) {
+    return {
+      fg: '#111111',
+      fgSoft: 'rgba(17, 17, 17, 0.72)',
+      fgMuted: 'rgba(17, 17, 17, 0.58)',
+    }
+  }
+
+  return {
+    fg: '#ffffff',
+    fgSoft: 'rgba(255, 255, 255, 0.72)',
+    fgMuted: 'rgba(255, 255, 255, 0.58)',
+  }
+}
+
+const getClaimString = (claims, propertyId) =>
+  claims?.[propertyId]?.[0]?.mainsnak?.datavalue?.value || ''
+
+const getClaimDate = (claims, propertyId) => {
+  const raw = claims?.[propertyId]?.[0]?.mainsnak?.datavalue?.value?.time
+  if (!raw) {
+    return ''
+  }
+
+  return formatWikiDate(raw.replace(/^\+/, '').split('T')[0])
+}
+
+const getClaimEntityIds = (claims, propertyId) =>
+  (claims?.[propertyId] || [])
+    .map((claim) => claim?.mainsnak?.datavalue?.value?.id)
+    .filter(Boolean)
+
+const fetchArtistFacts = async (artistName) => {
+  const searchQueries = Array.from(
+    new Set([normalizeArtistQuery(artistName), artistName].map((query) => query.trim()).filter(Boolean)),
+  )
+
+  let entityId = ''
+  for (const query of searchQueries) {
+    const searchResponse = await fetch(
+      `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(
+        query,
+      )}&language=en&format=json&formatversion=2&origin=*&limit=5`,
+    )
+    const searchJson = await searchResponse.json()
+    entityId = searchJson?.search?.[0]?.id || ''
+    if (entityId) {
+      break
+    }
+  }
+
+  if (!entityId) {
+    return null
+  }
+
+  const entityResponse = await fetch(
+    `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${entityId}&props=labels|descriptions|claims|sitelinks&languages=en&languagefallback=1&format=json&formatversion=2&origin=*`,
+  )
+  const entityJson = await entityResponse.json()
+  const entity = entityJson?.entities?.[entityId]
+  if (!entity) {
+    return null
+  }
+
+  const claims = entity.claims || {}
+  const memberIds = getClaimEntityIds(claims, 'P527').slice(0, 8)
+
+  let memberNames = []
+  if (memberIds.length) {
+    const membersResponse = await fetch(
+      `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${memberIds.join(
+        '|',
+      )}&props=labels&languages=en&languagefallback=1&format=json&formatversion=2&origin=*`,
+    )
+    const membersJson = await membersResponse.json()
+    memberNames = memberIds
+      .map((id) => membersJson?.entities?.[id]?.labels?.en?.value)
+      .filter(Boolean)
+  }
+
+  const wikiTitle = entity?.sitelinks?.enwiki?.title || ''
+  let summary = entity?.descriptions?.en?.value || ''
+
+  if (wikiTitle) {
+    const summaryResponse = await fetch(
+      `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(wikiTitle)}`,
+    )
+    if (summaryResponse.ok) {
+      const summaryJson = await summaryResponse.json()
+      summary = summaryJson?.extract || summary
+    }
+  }
+
+  return {
+    name: entity?.labels?.en?.value || artistName,
+    summary,
+    realName: getClaimString(claims, 'P1477'),
+    formedAt: getClaimDate(claims, 'P571'),
+    birthDate: getClaimDate(claims, 'P569'),
+    members: memberNames,
+  }
+}
+
+let dbPromise = null
+
+const openTracksDb = () => {
+  if (dbPromise) {
+    return dbPromise
+  }
+
+  dbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION)
+
+    request.onupgradeneeded = () => {
+      const db = request.result
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id' })
+      }
+    }
+
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+
+  return dbPromise
+}
+
+const getStoredTracks = async () => {
+  const db = await openTracksDb()
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly')
+    const request = tx.objectStore(STORE_NAME).getAll()
+
+    request.onsuccess = () => resolve(request.result || [])
+    request.onerror = () => reject(request.error)
+  })
+}
+
+const putStoredTracks = async (records) => {
+  const db = await openTracksDb()
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite')
+    const store = tx.objectStore(STORE_NAME)
+
+    store.clear()
+    records.forEach((record) => {
+      store.put(record)
+    })
+
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+const deleteStoredTrack = async (id) => {
+  const db = await openTracksDb()
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite')
+    tx.objectStore(STORE_NAME).delete(id)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+const loadJson = (key, fallback) => {
+  try {
+    return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback))
+  } catch {
+    return fallback
+  }
+}
+
+const saveJson = (key, value) => {
+  localStorage.setItem(key, JSON.stringify(value))
+}
+
+const loadUiPrefs = () => {
+  try {
+    return JSON.parse(localStorage.getItem(UI_KEY) || '{}')
+  } catch {
+    return {}
+  }
+}
+
+const saveUiPrefs = (prefs) => {
+  localStorage.setItem(UI_KEY, JSON.stringify(prefs))
+}
+
+const getUiThemeVars = (mode) => {
+  if (mode === 'light') {
+    return {
+      '--app-bg': '#edf1f5',
+      '--surface-bg': 'rgba(255, 255, 255, 0.84)',
+      '--surface-bg-strong': 'rgba(255, 255, 255, 0.94)',
+      '--surface-border': 'rgba(15, 23, 42, 0.12)',
+      '--text-primary': '#0f172a',
+      '--text-secondary': 'rgba(15, 23, 42, 0.62)',
+      '--text-muted': 'rgba(15, 23, 42, 0.48)',
+      '--control-bg': 'rgba(15, 23, 42, 0.08)',
+      '--control-bg-hover': 'rgba(15, 23, 42, 0.13)',
+      '--control-strong-bg': '#0f172a',
+      '--control-strong-fg': '#ffffff',
+      '--control-border': 'rgba(15, 23, 42, 0.12)',
+    }
+  }
+
+  if (mode === 'gray') {
+    return {
+      '--app-bg': '#101317',
+      '--surface-bg': 'rgba(24, 27, 34, 0.92)',
+      '--surface-bg-strong': 'rgba(29, 33, 42, 0.96)',
+      '--surface-border': 'rgba(255, 255, 255, 0.1)',
+      '--text-primary': '#f5f7fb',
+      '--text-secondary': 'rgba(245, 247, 251, 0.66)',
+      '--text-muted': 'rgba(245, 247, 251, 0.48)',
+      '--control-bg': 'rgba(255, 255, 255, 0.08)',
+      '--control-bg-hover': 'rgba(255, 255, 255, 0.12)',
+      '--control-strong-bg': '#f5f7fb',
+      '--control-strong-fg': '#0b0d10',
+      '--control-border': 'rgba(255, 255, 255, 0.08)',
+    }
+  }
+
+  return {
+    '--app-bg': '#000000',
+    '--surface-bg': 'rgba(13, 13, 13, 0.92)',
+    '--surface-bg-strong': 'rgba(18, 18, 18, 0.96)',
+    '--surface-border': 'rgba(255, 255, 255, 0.08)',
+    '--text-primary': '#ffffff',
+    '--text-secondary': 'rgba(255, 255, 255, 0.58)',
+    '--text-muted': 'rgba(255, 255, 255, 0.46)',
+    '--control-bg': 'rgba(255, 255, 255, 0.07)',
+    '--control-bg-hover': 'rgba(255, 255, 255, 0.12)',
+    '--control-strong-bg': '#ffffff',
+    '--control-strong-fg': '#000000',
+    '--control-border': 'rgba(255, 255, 255, 0.08)',
+  }
+}
+
+const loadArtistFactsCache = () => {
+  try {
+    return JSON.parse(localStorage.getItem(ARTIST_FACTS_KEY) || '{}')
+  } catch {
+    return {}
+  }
+}
+
+const saveArtistFactsCache = (cache) => {
+  localStorage.setItem(ARTIST_FACTS_KEY, JSON.stringify(cache))
+}
+
+const loadJsonCache = (key) => {
+  try {
+    return JSON.parse(localStorage.getItem(key) || '{}')
+  } catch {
+    return {}
+  }
+}
+
+const saveJsonCache = (key, value) => {
+  localStorage.setItem(key, JSON.stringify(value))
+}
+
+const scheduleIdle = (task) => {
+  if (typeof window.requestIdleCallback === 'function') {
+    return window.requestIdleCallback(() => task())
+  }
+
+  return window.setTimeout(task, 32)
+}
+
+const COVER_ART_CACHE_KEY = 'nova-player-cover-art-cache'
+const COVER_TONE_CACHE_KEY = 'nova-player-cover-tone-cache'
+
+const materializeTrack = (record, urlsRef) => {
+  if (!record?.audioBlob) {
+    return record
+  }
+
+  const audioUrl = URL.createObjectURL(record.audioBlob)
+  urlsRef.current.push(audioUrl)
+
+  let coverUrl = ''
+  if (record.coverBlob) {
+    coverUrl = URL.createObjectURL(record.coverBlob)
+    urlsRef.current.push(coverUrl)
+  }
+
+  return {
+    ...record,
+    audioUrl,
+    coverUrl,
+  }
+}
+
+const serializeTrack = (track) => {
+  if (track?.source === 'link') {
+    const { audioBlob: _audioBlob, coverBlob: _coverBlob, ...rest } = track
+    return {
+      ...rest,
+      audioUrl: normalizeDriveUrl(track.audioUrl || ''),
+      coverUrl: normalizeDriveUrl(track.coverUrl || ''),
+    }
+  }
+
+  const { audioUrl: _audioUrl, coverUrl: _coverUrl, ...rest } = track
+  return rest
+}
+
+const applyFavoriteFlags = (tracks, favoriteIds = []) => {
+  const favoriteSet = new Set(favoriteIds)
+  return tracks.map((track) => ({
+    ...track,
+    isFavorite: favoriteSet.has(track.id),
+  }))
+}
+
+const MotionDiv = motion.div
+const MotionSection = motion.section
+const MotionAside = motion.aside
+
+function App() {
+  const inputRef = useRef(null)
+  const coverInputRef = useRef(null)
+  const audioRef = useRef(null)
+  const audioContextRef = useRef(null)
+  const audioSourceRef = useRef(null)
+  const audioGainRef = useRef(null)
+  const equalizerFiltersRef = useRef([])
+  const assetUrlsRef = useRef([])
+  const artistFactsCacheRef = useRef(loadArtistFactsCache())
+  const coverArtCacheRef = useRef(loadJsonCache(COVER_ART_CACHE_KEY))
+  const coverToneCacheRef = useRef(loadJsonCache(COVER_TONE_CACHE_KEY))
+  const restoreSeekRef = useRef(null)
+  const restoreTrackIdRef = useRef(null)
+  const coverStageRef = useRef(null)
+  const savedUi = loadUiPrefs()
+  const [tracks, setTracks] = useState([])
+  const [serverTracks, setServerTracks] = useState([])
+  const [favoriteTrackIds, setFavoriteTrackIds] = useState(() => loadJson(FAVORITES_KEY, []))
+  const favoriteTrackIdsRef = useRef(favoriteTrackIds)
+  const [playlists, setPlaylists] = useState(() => loadJson(PLAYLISTS_KEY, []))
+  const [selectedCollectionId, setSelectedCollectionId] = useState(
+    savedUi.selectedCollectionId || 'all',
+  )
+  const [themeMode, setThemeMode] = useState(savedUi.themeMode || 'dark')
+  const [closeBehavior, setCloseBehavior] = useState(savedUi.closeBehavior || 'tray')
+  const [shuffleEnabled, setShuffleEnabled] = useState(savedUi.shuffleEnabled || false)
+  const [repeatEnabled, setRepeatEnabled] = useState(savedUi.repeatEnabled || false)
+  const [currentTrackId, setCurrentTrackId] = useState(null)
+  const [editTargetId, setEditTargetId] = useState(null)
+  const [editDraft, setEditDraft] = useState(null)
+  const [pendingCover, setPendingCover] = useState(null)
+  const [creatingPlaylist, setCreatingPlaylist] = useState(false)
+  const [playlistNameDraft, setPlaylistNameDraft] = useState('')
+  const [playlistColorDraft, setPlaylistColorDraft] = useState(playlistColors[0])
+  const [playlistCoverDraft, setPlaylistCoverDraft] = useState('')
+  const [editingPlaylistId, setEditingPlaylistId] = useState(null)
+  const [playlistEditDraft, setPlaylistEditDraft] = useState('')
+  const [playlistEditColorDraft, setPlaylistEditColorDraft] = useState(playlistColors[0])
+  const [playlistEditCoverDraft, setPlaylistEditCoverDraft] = useState('')
+  const [isPlaying, setIsPlaying] = useState(false)
+  const [dockFavoritePulseId, setDockFavoritePulseId] = useState(null)
+  const [progress, setProgress] = useState(0)
+  const [duration, setDuration] = useState(0)
+  const [volume, setVolume] = useState(typeof savedUi.volume === 'number' ? savedUi.volume : 0.85)
+  const [equalizerGains, setEqualizerGains] = useState(() => Array.isArray(savedUi.equalizerGains) ? savedUi.equalizerGains.slice(0, equalizerBands.length) : Array(equalizerBands.length).fill(0))
+  const equalizerGainsRef = useRef(equalizerGains)
+  const [audioOutputs, setAudioOutputs] = useState([])
+  const [selectedAudioOutputId, setSelectedAudioOutputId] = useState(savedUi.audioOutputId || 'default')
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [fullscreenTrackOpen, setFullscreenTrackOpen] = useState(false)
+  const [fullscreenControlsVisible, setFullscreenControlsVisible] = useState(false)
+  const fullscreenControlsTimerRef = useRef(null)
+  const [isMiniPlayerMode, setIsMiniPlayerMode] = useState(false)
+  const [miniVolumeOpen, setMiniVolumeOpen] = useState(false)
+  const [trackMenuId, setTrackMenuId] = useState(null)
+  const [trackMenuPosition, setTrackMenuPosition] = useState(null)
+  const [dockPlaylistMenuOpen, setDockPlaylistMenuOpen] = useState(false)
+  const [artistFactsLoading, setArtistFactsLoading] = useState(false)
+  const [playlistMenuTrackId, setPlaylistMenuTrackId] = useState(null)
+  const [playlistMenuPosition, setPlaylistMenuPosition] = useState(null)
+  const [artistFacts, setArtistFacts] = useState(null)
+  const [isHydrated, setIsHydrated] = useState(false)
+  const [uploadNotice, setUploadNotice] = useState('')
+  const uploadNoticeTimerRef = useRef(null)
+  const [addModalOpen, setAddModalOpen] = useState(false)
+  const [addMode, setAddMode] = useState('choose')
+  const [linkDraft, setLinkDraft] = useState({
+    title: '',
+    artist: '',
+    audioUrl: '',
+    coverUrl: '',
+  })
+  const persistStateRef = useRef({
+    selectedCollectionId,
+    currentTrackId,
+    progress,
+    volume,
+    isPlaying,
+    equalizerGains,
+  })
+  const playlistCoverInputRef = useRef(null)
+  const playlistEditCoverInputRef = useRef(null)
+  const dockFavoritePulseTimerRef = useRef(null)
+  const canSelectAudioOutput =
+    typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype
+
+  const allTracks = useMemo(() => [...tracks, ...serverTracks], [tracks, serverTracks])
+  const currentTrack = allTracks.find((track) => track.id === currentTrackId) || null
+  const editingTrack = tracks.find((track) => track.id === editTargetId) || null
+  const currentPlaylist = playlists.find((playlist) => playlist.id === selectedCollectionId) || null
+  const currentCoverUrl = getTrackCoverUrl(currentTrack)
+  const currentCoverTone = currentTrack?.coverTone || currentTrack?.gradient || gradients[0]
+  const currentCoverColors = getReadableCoverColors(currentCoverTone)
+  const fullscreenControlBg = currentCoverColors.fg === '#111111'
+    ? 'rgba(17, 17, 17, 0.18)'
+    : 'rgba(255, 255, 255, 0.16)'
+  const fullscreenControlBorder = currentCoverColors.fg === '#111111'
+    ? 'rgba(17, 17, 17, 0.18)'
+    : 'rgba(255, 255, 255, 0.18)'
+  const currentThemeColor =
+    selectedCollectionId === 'favorites'
+      ? '#ef4444'
+      : selectedCollectionId === 'server'
+        ? '#06b6d4'
+      : currentPlaylist?.color || '#60a5fa'
+  const themeVars = {
+    ...getUiThemeVars(themeMode),
+    '--theme-accent': hexToRgba(currentThemeColor, 0.24),
+    '--theme-accent-soft': hexToRgba(currentThemeColor, 0.08),
+  }
+  const activeCollectionLabel =
+    selectedCollectionId === 'favorites'
+      ? 'Favoriler'
+      : selectedCollectionId === 'server'
+        ? "Drive'dakiler"
+      : currentPlaylist?.name || 'TÃƒÆ’Ã‚Â¼m parÃƒÆ’Ã‚Â§alar'
+  const progressBucket = Math.floor(progress / 5)
+  const currentTrackPresenceId = currentTrack?.id || null
+  const currentTrackPresenceTitle = currentTrack?.title || ''
+  const currentTrackPresenceArtist = currentTrack?.artist || ''
+  const artistFactLine = artistFacts
+    ? [
+        artistFacts.realName ? `GerÃƒÆ’Ã‚Â§ek ad: ${artistFacts.realName}` : '',
+        artistFacts.formedAt ? `KuruluÃƒâ€¦Ã…Â¸: ${artistFacts.formedAt}` : '',
+        artistFacts.birthDate ? `DoÃƒâ€Ã…Â¸um: ${artistFacts.birthDate}` : '',
+        artistFacts.members?.length ? `ÃƒÆ’Ã…â€œyeler: ${artistFacts.members.join(', ')}` : '',
+      ]
+        .filter(Boolean)
+        .join(' Ãƒâ€šÃ‚Â· ')
+    : ''
+  const totalDuration = useMemo(
+    () => tracks.reduce((sum, track) => sum + (track.duration || 0), 0),
+    [tracks],
+  )
+
+  const getNextTrack = () => {
+    if (!visibleTracks.length) {
+      return null
+    }
+
+    if (shuffleEnabled) {
+      const pool = visibleTracks.filter((track) => track.id !== currentTrackId)
+      const source = pool.length ? pool : visibleTracks
+      return source[Math.floor(Math.random() * source.length)] || null
+    }
+
+    const activeIndex = visibleTracks.findIndex((track) => track.id === currentTrackId)
+    const nextIndex = activeIndex >= 0 ? (activeIndex + 1) % visibleTracks.length : 0
+    return visibleTracks[nextIndex] || null
+  }
+
+  const visibleTracks = useMemo(() => {
+    if (selectedCollectionId === 'favorites') {
+      return sortTracksByOrder(allTracks.filter((track) => track.isFavorite))
+    }
+
+      if (selectedCollectionId === 'server') {
+        return sortTracksByOrder(serverTracks)
+      }
+
+    if (selectedCollectionId !== 'all') {
+      const playlist = playlists.find((item) => item.id === selectedCollectionId)
+      if (playlist) {
+        return sortTracksByOrder(allTracks.filter((track) => playlist.trackIds.includes(track.id)))
+      }
+    }
+
+    return sortTracksByOrder(tracks)
+  }, [allTracks, playlists, selectedCollectionId, serverTracks, tracks])
+
+  const updateTrack = (trackId, updates) => {
+    setTracks((prev) =>
+      prev.map((track) => (track.id === trackId ? { ...track, ...updates } : track)),
+    )
+  }
+
+  const moveTrackUp = (trackId) => {
+    setTracks((prev) => {
+      const ordered = sortTracksByOrder(prev)
+      const index = ordered.findIndex((track) => track.id === trackId)
+      if (index <= 0) {
+        return prev
+      }
+
+      const next = ordered.map((track) => ({ ...track }))
+      const current = next[index]
+      const previous = next[index - 1]
+      const currentOrder = getTrackSortValue(current, index)
+      const previousOrder = getTrackSortValue(previous, index - 1)
+
+      next[index] = { ...current, order: previousOrder }
+      next[index - 1] = { ...previous, order: currentOrder }
+      return next
+    })
+  }
+
+  const openEditor = (track) => {
+    setEditTargetId(track.id)
+    setEditDraft({ title: track.title, artist: track.artist })
+    setPendingCover(null)
+  }
+
+  const closeEditor = () => {
+    setEditTargetId(null)
+    setEditDraft(null)
+    setPendingCover(null)
+  }
+
+  const openPlaylistCreator = () => {
+    setPlaylistNameDraft('')
+    setPlaylistColorDraft(playlistColors[playlists.length % playlistColors.length])
+    setPlaylistCoverDraft('')
+    setCreatingPlaylist(true)
+  }
+
+  const closePlaylistCreator = () => {
+    setCreatingPlaylist(false)
+    setPlaylistNameDraft('')
+    setPlaylistCoverDraft('')
+  }
+
+  const openPlaylistEditor = (playlist) => {
+    setEditingPlaylistId(playlist.id)
+    setPlaylistEditDraft(playlist.name)
+    setPlaylistEditColorDraft(playlist.color || playlistColors[0])
+    setPlaylistEditCoverDraft(playlist.coverUrl || '')
+  }
+
+  const closePlaylistEditor = () => {
+    setEditingPlaylistId(null)
+    setPlaylistEditDraft('')
+    setPlaylistEditCoverDraft('')
+  }
+
+  const closeMenus = () => {
+    setTrackMenuId(null)
+    setTrackMenuPosition(null)
+    setDockPlaylistMenuOpen(false)
+    setPlaylistMenuTrackId(null)
+    setPlaylistMenuPosition(null)
+    setSettingsOpen(false)
+  }
+
+  const setAppFullscreen = useCallback((nextState) => {
+    if (typeof window !== 'undefined' && window.novaPlayer?.setWindowFullscreen) {
+      window.novaPlayer.setWindowFullscreen(nextState)
+    }
+  }, [])
+
+  const revealFullscreenControls = useCallback(() => {
+    setFullscreenControlsVisible(true)
+
+    if (fullscreenControlsTimerRef.current) {
+      window.clearTimeout(fullscreenControlsTimerRef.current)
+    }
+
+    fullscreenControlsTimerRef.current = window.setTimeout(() => {
+      setFullscreenControlsVisible(false)
+      fullscreenControlsTimerRef.current = null
+    }, 2200)
+  }, [])
+
+  const hideFullscreenControls = useCallback(() => {
+    if (fullscreenControlsTimerRef.current) {
+      window.clearTimeout(fullscreenControlsTimerRef.current)
+      fullscreenControlsTimerRef.current = null
+    }
+
+    setFullscreenControlsVisible(false)
+  }, [])
+
+  const openFullscreenTrack = useCallback(() => {
+    if (currentTrack) {
+      setFullscreenTrackOpen(true)
+      setAppFullscreen(true)
+      revealFullscreenControls()
+    }
+  }, [currentTrack, revealFullscreenControls, setAppFullscreen])
+
+  const closeFullscreenTrack = useCallback(() => {
+    setFullscreenTrackOpen(false)
+    setAppFullscreen(false)
+    hideFullscreenControls()
+  }, [hideFullscreenControls, setAppFullscreen])
+
+  useEffect(() => {
+    if (!fullscreenTrackOpen) {
+      hideFullscreenControls()
+      return undefined
+    }
+
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        closeFullscreenTrack()
+      }
+    }
+
+    revealFullscreenControls()
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      hideFullscreenControls()
+    }
+  }, [fullscreenTrackOpen, closeFullscreenTrack, hideFullscreenControls, revealFullscreenControls])
+
+  const setAppMiniMode = useCallback((nextState) => {
+    if (typeof window !== 'undefined' && window.novaPlayer?.setMiniMode) {
+      window.novaPlayer.setMiniMode(nextState)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!window.novaPlayer?.onMiniModeChange) {
+      return undefined
+    }
+
+    return window.novaPlayer.onMiniModeChange((nextState) => {
+      setIsMiniPlayerMode(Boolean(nextState))
+      setMiniVolumeOpen(false)
+      setDockPlaylistMenuOpen(false)
+      setTrackMenuId(null)
+      setPlaylistMenuTrackId(null)
+      setPlaylistMenuPosition(null)
+    })
+  }, [])
+
+  useEffect(() => {
+    const syncMiniModeFromWindowSize = () => {
+      const shouldUseMiniPlayer = window.innerWidth <= 500 && window.innerHeight <= 260
+
+      setIsMiniPlayerMode((prev) => {
+        if (prev === shouldUseMiniPlayer) {
+          return prev
+        }
+
+        if (shouldUseMiniPlayer) {
+          setMiniVolumeOpen(false)
+          setDockPlaylistMenuOpen(false)
+          setTrackMenuId(null)
+          setPlaylistMenuTrackId(null)
+          setPlaylistMenuPosition(null)
+        }
+
+        return shouldUseMiniPlayer
+      })
+    }
+
+    syncMiniModeFromWindowSize()
+    window.addEventListener('resize', syncMiniModeFromWindowSize)
+
+    return () => {
+      window.removeEventListener('resize', syncMiniModeFromWindowSize)
+    }
+  }, [])
+  const updateAppSettings = (nextSettings) => {
+    if (typeof window !== 'undefined' && window.novaPlayer?.updateAppSettings) {
+      window.novaPlayer.updateAppSettings(nextSettings)
+    }
+  }
+
+  const openUploadPicker = () => {
+    openAddModal()
+  }
+
+  const showUploadNotice = (message) => {
+    setUploadNotice(message)
+    if (uploadNoticeTimerRef.current) {
+      window.clearTimeout(uploadNoticeTimerRef.current)
+    }
+
+    uploadNoticeTimerRef.current = window.setTimeout(() => {
+      setUploadNotice('')
+      uploadNoticeTimerRef.current = null
+    }, 3000)
+  }
+
+  const openAddModal = () => {
+    setAddMode('choose')
+    setAddModalOpen(true)
+    setLinkDraft({
+      title: '',
+      artist: '',
+      audioUrl: '',
+      coverUrl: '',
+    })
+  }
+
+  const closeAddModal = () => {
+    setAddModalOpen(false)
+    setAddMode('choose')
+    setLinkDraft({
+      title: '',
+      artist: '',
+      audioUrl: '',
+      coverUrl: '',
+    })
+  }
+
+  const searchYouTube = (track) => {
+    const query = encodeURIComponent(`${track.title} ${track.artist}`)
+    window.novaPlayer?.openExternal?.(`https://www.youtube.com/results?search_query=${query}`)
+  }
+
+  const releaseTrackResources = (track) => {
+    if (track.audioUrl?.startsWith('blob:')) {
+      URL.revokeObjectURL(track.audioUrl)
+    }
+
+    if (track.coverUrl?.startsWith('blob:')) {
+      URL.revokeObjectURL(track.coverUrl)
+    }
+
+    assetUrlsRef.current = assetUrlsRef.current.filter(
+      (url) => url !== track.audioUrl && url !== track.coverUrl,
+    )
+  }
+
+  useEffect(() => {
+    const audio = audioRef.current
+    if (audio) {
+      audio.volume = volume
+    }
+  }, [volume])
+
+  useEffect(() => {
+    equalizerGainsRef.current = equalizerGains
+  }, [equalizerGains])
+
+  useEffect(() => {
+    if (!isPlaying) {
+      return undefined
+    }
+
+    const context = audioContextRef.current
+    if (context?.state === 'suspended') {
+      context.resume().catch(() => {})
+    }
+
+    return undefined
+  }, [isPlaying])
+  useEffect(() => {
+    const audio = audioRef.current
+    if (!audio) {
+      return undefined
+    }
+
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext
+    if (!AudioContextCtor) {
+      return undefined
+    }
+
+    let cancelled = false
+
+    const ensureGraph = async () => {
+      if (!audioContextRef.current) {
+        const context = new AudioContextCtor()
+        const source = context.createMediaElementSource(audio)
+        const filters = equalizerBands.map((band, index) => {
+          const filter = context.createBiquadFilter()
+          filter.type = band.type
+          filter.frequency.value = band.frequency
+          filter.Q.value = band.q
+          filter.gain.value = equalizerGainsRef.current[index] || 0
+          return filter
+        })
+        const outputGain = context.createGain()
+        outputGain.gain.value = 1
+
+        source.connect(filters[0])
+        filters.forEach((filter, index) => {
+          if (filters[index + 1]) {
+            filter.connect(filters[index + 1])
+          } else {
+            filter.connect(outputGain)
+          }
+        })
+        outputGain.connect(context.destination)
+
+        audioContextRef.current = context
+        audioSourceRef.current = source
+        audioGainRef.current = outputGain
+        equalizerFiltersRef.current = filters
+      }
+
+      if (!cancelled && audioContextRef.current?.state === 'suspended') {
+        try {
+          await audioContextRef.current.resume()
+        } catch {
+          // ignore resume failures
+        }
+      }
+    }
+
+    ensureGraph().catch(() => {})
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    equalizerFiltersRef.current.forEach((filter, index) => {
+      if (filter) {
+        filter.gain.value = equalizerGainsRef.current[index] || 0
+      }
+    })
+  }, [equalizerGains])
+
+  useEffect(() => {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      return undefined
+    }
+
+    let cancelled = false
+    const loadOutputs = async () => {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices()
+        if (!cancelled) {
+          setAudioOutputs(devices.filter((device) => device.kind === 'audiooutput'))
+        }
+      } catch {
+        if (!cancelled) {
+          setAudioOutputs([])
+        }
+      }
+    }
+
+    loadOutputs()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    const audio = audioRef.current
+    if (!audio || !canSelectAudioOutput || typeof audio.setSinkId !== 'function') {
+      return undefined
+    }
+
+    audio.setSinkId(selectedAudioOutputId).catch(() => {
+      setSettingsOpen(false)
+    })
+
+    return undefined
+  }, [canSelectAudioOutput, currentTrackId, selectedAudioOutputId, isHydrated])
+
+  useEffect(() => {
+    favoriteTrackIdsRef.current = favoriteTrackIds
+  }, [favoriteTrackIds])
+
+  useEffect(() => {
+    persistStateRef.current = {
+      selectedCollectionId,
+      currentTrackId,
+      progress,
+      volume,
+      isPlaying,
+      equalizerGains,
+    }
+  }, [currentTrackId, isPlaying, progress, selectedCollectionId, volume, equalizerGains])
+
+  useEffect(() => {
+    let cancelled = false
+
+    const hydrate = async () => {
+        try {
+          const [storedTracks, prefs, storedPlaylists] = await Promise.all([
+            getStoredTracks(),
+            Promise.resolve(loadUiPrefs()),
+            Promise.resolve(loadJson(PLAYLISTS_KEY, [])),
+        ])
+        if (cancelled) {
+          return
+        }
+
+          const restoredTracks = storedTracks.map((record) => ({
+            ...materializeTrack(record, assetUrlsRef),
+            source: record.source || (record.audioBlob ? 'local' : 'link'),
+          }))
+          setTracks(applyFavoriteFlags(restoredTracks, favoriteTrackIdsRef.current))
+        setPlaylists(
+          storedPlaylists.map((playlist, index) => ({
+            ...playlist,
+            color: playlist.color || playlistColors[index % playlistColors.length],
+            coverUrl: playlist.coverUrl || '',
+          })),
+        )
+        setSelectedCollectionId(prefs.selectedCollectionId || 'all')
+        setShuffleEnabled(Boolean(prefs.shuffleEnabled))
+        setRepeatEnabled(Boolean(prefs.repeatEnabled))
+        setCurrentTrackId(
+          restoredTracks.find((track) => track.id === prefs.currentTrackId)?.id || restoredTracks[0]?.id || null,
+        )
+        setVolume(typeof prefs.volume === 'number' ? prefs.volume : 0.85)
+        setEqualizerGains(Array.isArray(prefs.equalizerGains) ? prefs.equalizerGains.slice(0, equalizerBands.length).map((value) => Number(value) || 0).concat(Array(Math.max(0, equalizerBands.length - (prefs.equalizerGains || []).length)).fill(0)).slice(0, equalizerBands.length) : Array(equalizerBands.length).fill(0))
+        setProgress(typeof prefs.progress === 'number' ? prefs.progress : 0)
+        setIsPlaying(Boolean(prefs.isPlaying))
+        const hasSavedTrack = restoredTracks.some((track) => track.id === prefs.currentTrackId)
+        restoreTrackIdRef.current = hasSavedTrack ? prefs.currentTrackId : null
+        restoreSeekRef.current =
+          hasSavedTrack && typeof prefs.progress === 'number' ? prefs.progress : 0
+      } catch {
+        if (!cancelled) {
+          setTracks([])
+        }
+      } finally {
+        if (!cancelled) {
+          setIsHydrated(true)
+        }
+      }
+    }
+
+    hydrate()
+
+    return () => {
+      cancelled = true
+      assetUrlsRef.current.forEach((url) => URL.revokeObjectURL(url))
+      if (uploadNoticeTimerRef.current) {
+        window.clearTimeout(uploadNoticeTimerRef.current)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isHydrated) {
+      return undefined
+    }
+
+    const timeout = window.setTimeout(() => {
+      putStoredTracks(tracks.map(serializeTrack)).catch(() => {})
+      saveJson(PLAYLISTS_KEY, playlists)
+      saveJson(FAVORITES_KEY, favoriteTrackIds)
+      saveUiPrefs({
+        selectedCollectionId,
+        currentTrackId,
+        volume,
+        isPlaying,
+        equalizerGains,
+        audioOutputId: selectedAudioOutputId,
+        themeMode,
+        closeBehavior,
+        shuffleEnabled,
+        repeatEnabled,
+      })
+    }, 180)
+
+    return () => window.clearTimeout(timeout)
+    }, [
+      favoriteTrackIds,
+      tracks,
+      playlists,
+      selectedCollectionId,
+      currentTrackId,
+      volume,
+      isPlaying,
+      selectedAudioOutputId,
+      isHydrated,
+      themeMode,
+      closeBehavior,
+      shuffleEnabled,
+      repeatEnabled,
+      equalizerGains,
+    ])
+
+  useEffect(() => {
+    if (!isHydrated || !currentTrackId || !isPlaying) {
+      return undefined
+    }
+
+    const interval = window.setInterval(() => {
+      const snapshot = persistStateRef.current
+      saveUiPrefs({
+        selectedCollectionId: snapshot.selectedCollectionId,
+        currentTrackId: snapshot.currentTrackId,
+        progress: snapshot.progress,
+        volume: snapshot.volume,
+        isPlaying: snapshot.isPlaying,
+        equalizerGains: snapshot.equalizerGains,
+        audioOutputId: selectedAudioOutputId,
+        themeMode,
+        closeBehavior,
+        shuffleEnabled,
+      })
+    }, 5000)
+
+    return () => window.clearInterval(interval)
+  }, [closeBehavior, currentTrackId, isHydrated, isPlaying, selectedAudioOutputId, shuffleEnabled, themeMode])
+
+  useEffect(() => {
+    const audio = audioRef.current
+    if (!audio) {
+      return undefined
+    }
+
+    const handleTimeUpdate = () => setProgress(audio.currentTime)
+    const handleLoadedMetadata = () => {
+      const nextDuration = audio.duration || 0
+      setDuration(nextDuration)
+
+      if (currentTrack?.id && Number.isFinite(nextDuration) && nextDuration > 0 && currentTrack.duration !== nextDuration) {
+        updateTrack(currentTrack.id, { duration: nextDuration })
+      }
+
+      if (restoreTrackIdRef.current && currentTrack?.id === restoreTrackIdRef.current) {
+        const nextTime = Math.min(restoreSeekRef.current || 0, nextDuration || 0)
+        if (Number.isFinite(nextTime) && nextTime >= 0) {
+          audio.currentTime = nextTime
+          setProgress(nextTime)
+        }
+
+        restoreTrackIdRef.current = null
+        restoreSeekRef.current = null
+      }
+    }
+    const handleEnded = () => {
+      if (!currentTrack) {
+        setIsPlaying(false)
+        return
+      }
+
+      if (repeatEnabled) {
+        audio.currentTime = 0
+        setProgress(0)
+        setDuration(currentTrack.duration || 0)
+        restoreSeekRef.current = 0
+        audio.play().catch(() => {})
+        setIsPlaying(true)
+        return
+      }
+
+      if (!visibleTracks.length) {
+        setIsPlaying(false)
+        return
+      }
+
+      const activeIndex = visibleTracks.findIndex((track) => track.id === currentTrackId)
+      const nextIndex = activeIndex >= 0 ? (activeIndex + 1) % visibleTracks.length : 0
+      const nextTrack = visibleTracks[nextIndex]
+      setProgress(0)
+      setDuration(nextTrack?.duration || 0)
+      setCurrentTrackId(nextTrack.id)
+      setIsPlaying(true)
+      restoreSeekRef.current = 0
+    }
+
+    const handleError = () => {
+      setIsPlaying(false)
+      if (currentTrack?.source === 'link') {
+      showUploadNotice('Bu link oynatÃƒâ€Ã‚Â±lamadÃƒâ€Ã‚Â±. Drive iÃƒÆ’Ã‚Â§in doÃƒâ€Ã…Â¸rudan medya veya indirilebilir dosya baÃƒâ€Ã…Â¸lantÃƒâ€Ã‚Â±sÃƒâ€Ã‚Â± gerekir.')
+      }
+    }
+
+    audio.addEventListener('timeupdate', handleTimeUpdate)
+    audio.addEventListener('loadedmetadata', handleLoadedMetadata)
+    audio.addEventListener('ended', handleEnded)
+    audio.addEventListener('error', handleError)
+
+    return () => {
+      audio.removeEventListener('timeupdate', handleTimeUpdate)
+      audio.removeEventListener('loadedmetadata', handleLoadedMetadata)
+      audio.removeEventListener('ended', handleEnded)
+      audio.removeEventListener('error', handleError)
+    }
+  }, [currentTrack, currentTrackId, visibleTracks, repeatEnabled])
+
+  useEffect(() => {
+    const audio = audioRef.current
+    if (!audio) {
+      return undefined
+    }
+
+    if (!currentTrack) {
+      audio.pause()
+      audio.removeAttribute('src')
+      audio.load()
+      return undefined
+    }
+
+    if (audio.src !== currentTrack.audioUrl) {
+      audio.src = currentTrack.audioUrl
+      audio.load()
+    }
+
+    return undefined
+  }, [currentTrack])
+
+  useEffect(() => {
+    const audio = audioRef.current
+    if (!audio || !currentTrack) {
+      return undefined
+    }
+
+    if (isPlaying) {
+      audio.play().catch(() => {
+        setIsPlaying(false)
+        if (currentTrack?.source === 'link') {
+      showUploadNotice('Bu link oynatÃƒâ€Ã‚Â±lamadÃƒâ€Ã‚Â±. Drive iÃƒÆ’Ã‚Â§in doÃƒâ€Ã…Â¸rudan medya veya indirilebilir dosya baÃƒâ€Ã…Â¸lantÃƒâ€Ã‚Â±sÃƒâ€Ã‚Â± gerekir.')
+        }
+      })
+    } else {
+      audio.pause()
+    }
+
+    return undefined
+  }, [currentTrack, isPlaying])
+
+  useEffect(() => {
+    if (!window.novaPlayer?.setPresence) {
+      return undefined
+    }
+
+    if (!currentTrackPresenceId) {
+      window.novaPlayer.setPresence({ track: null })
+      return undefined
+    }
+
+    window.novaPlayer.setPresence({
+      track: {
+        title: currentTrackPresenceTitle,
+        artist: currentTrackPresenceArtist,
+      },
+      isPlaying,
+      startTimestamp: Date.now() - progressBucket * 5000,
+    })
+
+    return undefined
+  }, [currentTrackPresenceId, currentTrackPresenceTitle, currentTrackPresenceArtist, isPlaying, progressBucket])
+
+  useEffect(() => {
+    if (!DRIVE_MANIFEST_URL) {
+      setServerTracks([])
+      return undefined
+    }
+
+    let cancelled = false
+
+    const loadDriveTracks = async () => {
+      try {
+        const response = await fetch(normalizeDriveUrl(DRIVE_MANIFEST_URL), { cache: 'no-store' })
+        if (!response.ok) {
+          return
+        }
+
+        const json = await response.json()
+        const trackList = Array.isArray(json) ? json : Array.isArray(json?.tracks) ? json.tracks : Array.isArray(json?.items) ? json.items : []
+        const nextTracks = applyFavoriteFlags(
+          trackList.map(normalizeDriveTrack),
+          favoriteTrackIds,
+        )
+        if (!cancelled) {
+          setServerTracks(nextTracks)
+        }
+      } catch {
+        if (!cancelled) {
+          setServerTracks([])
+        }
+      }
+    }
+
+    loadDriveTracks()
+    const interval = window.setInterval(loadDriveTracks, 60000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [favoriteTrackIds])
+
+  useEffect(() => {
+    const artistName = normalizeArtistQuery(currentTrack?.artist || '')
+    if (!artistName || artistName === 'Yerel Koleksiyon') {
+      setArtistFacts(null)
+      setArtistFactsLoading(false)
+      return undefined
+    }
+
+    setArtistFacts(null)
+    const cachedFacts = artistFactsCacheRef.current[artistName]
+    if (Object.prototype.hasOwnProperty.call(artistFactsCacheRef.current, artistName)) {
+      setArtistFacts(cachedFacts)
+      setArtistFactsLoading(false)
+      return undefined
+    }
+
+    let cancelled = false
+    setArtistFactsLoading(true)
+
+    const loadArtistFacts = async () => {
+      try {
+        const facts = await fetchArtistFacts(artistName)
+        if (cancelled) {
+          return
+        }
+
+        artistFactsCacheRef.current[artistName] = facts
+        saveArtistFactsCache(artistFactsCacheRef.current)
+        setArtistFacts(facts)
+      } catch {
+        if (!cancelled) {
+          artistFactsCacheRef.current[artistName] = null
+          saveArtistFactsCache(artistFactsCacheRef.current)
+          setArtistFacts(null)
+        }
+      } finally {
+        if (!cancelled) {
+          setArtistFactsLoading(false)
+        }
+      }
+    }
+
+    loadArtistFacts()
+
+    return () => {
+      cancelled = true
+    }
+  }, [currentTrack?.artist, currentTrack?.id])
+
+  useEffect(() => {
+    saveUiPrefs({
+      ...loadUiPrefs(),
+      themeMode,
+      closeBehavior,
+    })
+    updateAppSettings({ themeMode, closeBehavior })
+  }, [closeBehavior, themeMode])
+
+  useEffect(() => {
+    if (!isHydrated) {
+      return undefined
+    }
+
+    let cancelled = false
+    const missingCovers = tracks.filter(
+      (track) =>
+        !track.coverUrl &&
+        !track.coverRemoteUrl &&
+        track.title &&
+        track.artist &&
+        track.artist !== 'Yerel Koleksiyon',
+    )
+
+    const runQueue = async () => {
+      for (const track of missingCovers) {
+        if (cancelled) {
+          break
+        }
+
+        const cacheKey = `${normalizeArtistQuery(track.artist)}|${track.title}`.toLowerCase()
+
+        if (Object.prototype.hasOwnProperty.call(coverArtCacheRef.current, cacheKey)) {
+          const cachedUrl = coverArtCacheRef.current[cacheKey]
+          if (cachedUrl && !cancelled) {
+            updateTrack(track.id, { coverRemoteUrl: cachedUrl })
+          }
+          await new Promise((resolve) => scheduleIdle(resolve))
+          continue
+        }
+
+        try {
+          const url = await fetchRemoteCoverArt(track.title, track.artist)
+          if (cancelled) {
+            break
+          }
+
+          coverArtCacheRef.current[cacheKey] = url || ''
+          saveJsonCache(COVER_ART_CACHE_KEY, coverArtCacheRef.current)
+          if (url) {
+            updateTrack(track.id, { coverRemoteUrl: url })
+          }
+        } catch {
+          if (!cancelled) {
+            coverArtCacheRef.current[cacheKey] = ''
+            saveJsonCache(COVER_ART_CACHE_KEY, coverArtCacheRef.current)
+          }
+        }
+
+        await new Promise((resolve) => scheduleIdle(resolve))
+      }
+    }
+
+    runQueue().catch(() => {})
+
+    return () => {
+      cancelled = true
+    }
+  }, [isHydrated, tracks])
+
+  useEffect(() => {
+    if (!isHydrated) {
+      return undefined
+    }
+
+    let cancelled = false
+    const tracksNeedingTone = tracks.filter(
+      (track) =>
+        !track.coverTone && (track.coverUrl || track.coverRemoteUrl) && track.id,
+    )
+
+    const runQueue = async () => {
+      for (const track of tracksNeedingTone) {
+        if (cancelled) {
+          break
+        }
+
+        const source = track.coverUrl || track.coverRemoteUrl
+        const cacheKey = source || track.id
+
+        if (Object.prototype.hasOwnProperty.call(coverToneCacheRef.current, cacheKey)) {
+          const cachedTone = coverToneCacheRef.current[cacheKey]
+          if (cachedTone && !cancelled) {
+            updateTrack(track.id, { coverTone: cachedTone })
+          }
+          await new Promise((resolve) => scheduleIdle(resolve))
+          continue
+        }
+
+        try {
+          const tone = await extractDominantColor(source)
+          if (cancelled) {
+            break
+          }
+
+          coverToneCacheRef.current[cacheKey] = tone || ''
+          saveJsonCache(COVER_TONE_CACHE_KEY, coverToneCacheRef.current)
+          if (tone) {
+            updateTrack(track.id, { coverTone: tone })
+          }
+        } catch {
+          if (!cancelled) {
+            coverToneCacheRef.current[cacheKey] = ''
+            saveJsonCache(COVER_TONE_CACHE_KEY, coverToneCacheRef.current)
+          }
+        }
+
+        await new Promise((resolve) => scheduleIdle(resolve))
+      }
+    }
+
+    runQueue().catch(() => {})
+
+    return () => {
+      cancelled = true
+    }
+  }, [isHydrated, tracks])
+
+  useEffect(() => {
+    setDockPlaylistMenuOpen(false)
+  }, [currentTrackId])
+
+  const handleUpload = async (event) => {
+    const files = Array.from(event.target.files || [])
+    if (!files.length) {
+      return
+    }
+
+    const existingSignatures = new Set(allTracks.map(getTrackSignature))
+    const createdTracks = []
+    const nextTrackOrder =
+      Math.max(-1, ...allTracks.map((track, index) => getTrackSortValue(track, index))) + 1
+    let duplicateName = ''
+
+    for (const [index, file] of files.entries()) {
+      const audioUrl = URL.createObjectURL(file)
+      const metadata = await readTrackMetadata(file)
+      const parsedName = parseTrackName(file.name)
+      const title = metadata?.title || parsedName.title
+      const artist = metadata?.artist || parsedName.artist
+      const durationValue = await readDuration(audioUrl)
+      const signature = getTrackSignature({
+        title,
+        artist,
+        size: `${(file.size / 1024 / 1024).toFixed(1)} MB`,
+        duration: durationValue,
+      })
+
+      if (existingSignatures.has(signature)) {
+        URL.revokeObjectURL(audioUrl)
+        if (!duplicateName) {
+          duplicateName = `${artist} - ${title}`.trim()
+        }
+        continue
+      }
+
+      existingSignatures.add(signature)
+      const remoteCoverUrl =
+        title && artist && artist !== 'Yerel Koleksiyon'
+          ? await fetchRemoteCoverArt(title, artist)
+          : ''
+
+      assetUrlsRef.current.push(audioUrl)
+
+      createdTracks.push({
+        id: `${file.name}-${file.lastModified}-${index}`,
+        title,
+        artist,
+        fileName: file.name,
+        size: `${(file.size / 1024 / 1024).toFixed(1)} MB`,
+        duration: durationValue,
+        gradient: gradients[(tracks.length + index) % gradients.length],
+        audioBlob: file,
+        audioUrl,
+        coverBlob: null,
+        coverUrl: '',
+        coverRemoteUrl: remoteCoverUrl,
+        coverTone: '',
+        coverName: '',
+        isFavorite: false,
+        createdAt: Date.now(),
+        order: nextTrackOrder + index,
+        source: 'local',
+      })
+    }
+
+    if (createdTracks.length) {
+      setTracks((prev) => [...prev, ...createdTracks])
+    }
+
+    if (duplicateName) {
+      showUploadNotice(`${duplicateName} zaten ekli.`)
+    }
+
+    if (!currentTrackId && createdTracks[0]) {
+      setProgress(0)
+      setDuration(createdTracks[0].duration || 0)
+      setCurrentTrackId(createdTracks[0].id)
+      setIsPlaying(false)
+      openEditor(createdTracks[0])
+      restoreSeekRef.current = 0
+    }
+
+    event.target.value = ''
+    closeAddModal()
+  }
+
+  const handleLinkAdd = async () => {
+    const title = linkDraft.title.trim()
+    const artist = linkDraft.artist.trim()
+    const audioUrl = normalizeDriveUrl(linkDraft.audioUrl)
+    const coverUrlInput = normalizeDriveUrl(linkDraft.coverUrl)
+
+    if (!title || !artist || !audioUrl) {
+      showUploadNotice('BaÃƒâ€¦Ã…Â¸lÃƒâ€Ã‚Â±k, sanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â± ve link gerekli.')
+      return
+    }
+
+    const signature = getTrackSignature({
+      title,
+      artist,
+      audioUrl,
+      source: 'link',
+    })
+
+    if (allTracks.some((track) => getTrackSignature(track) === signature)) {
+      showUploadNotice(`${artist} - ${title} zaten ekli.`)
+      return
+    }
+
+    const remoteCoverUrl =
+      coverUrlInput || (artist && title && artist !== 'Yerel Koleksiyon'
+        ? await fetchRemoteCoverArt(title, artist)
+        : '')
+    const durationValue = await readDuration(audioUrl)
+
+    const nextTrack = {
+      id: `link-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title,
+      artist,
+      fileName: '',
+      size: '',
+      duration: durationValue,
+      gradient: gradients[tracks.length % gradients.length],
+      audioUrl,
+      coverBlob: null,
+      coverUrl: remoteCoverUrl,
+      coverRemoteUrl: remoteCoverUrl,
+      coverTone: '',
+      coverName: coverUrlInput ? 'BaÃƒâ€Ã…Â¸lantÃƒâ€Ã‚Â± kapaÃƒâ€Ã…Â¸Ãƒâ€Ã‚Â±' : '',
+      isFavorite: false,
+      createdAt: Date.now(),
+      order:
+        Math.max(-1, ...allTracks.map((track, index) => getTrackSortValue(track, index))) + 1,
+      source: 'link',
+    }
+
+    setTracks((prev) => [...prev, nextTrack])
+    if (!currentTrackId) {
+      setProgress(0)
+      setDuration(durationValue || 0)
+      setCurrentTrackId(nextTrack.id)
+      setIsPlaying(false)
+      restoreSeekRef.current = 0
+    }
+
+    closeAddModal()
+    showUploadNotice('BaÃƒâ€Ã…Â¸lantÃƒâ€Ã‚Â± eklendi.')
+  }
+
+  const togglePlayback = () => {
+    if (!allTracks.length) {
+      openAddModal()
+      return
+    }
+
+    if (!currentTrack && allTracks[0]) {
+      const starterTrack = shuffleEnabled ? (getNextTrack() || visibleTracks[0] || allTracks[0]) : (visibleTracks[0] || allTracks[0])
+      setProgress(0)
+      setDuration(starterTrack.duration || 0)
+      setCurrentTrackId(starterTrack.id)
+      setIsPlaying(true)
+      restoreSeekRef.current = 0
+      return
+    }
+
+    setIsPlaying((prev) => !prev)
+  }
+
+  const playTrack = (trackId) => {
+    const selectedTrack = allTracks.find((track) => track.id === trackId)
+    if (!selectedTrack) {
+      return
+    }
+
+    setProgress(0)
+    setDuration(selectedTrack.duration || 0)
+    setCurrentTrackId(trackId)
+    setIsPlaying(true)
+    restoreSeekRef.current = 0
+    closeMenus()
+  }
+
+  const restartTrack = () => {
+    const audio = audioRef.current
+    if (!audio || !currentTrack) {
+      return
+    }
+
+    audio.currentTime = 0
+    setProgress(0)
+    restoreSeekRef.current = 0
+  }
+
+  const stepTrack = () => {
+    const nextTrack = getNextTrack()
+    if (!nextTrack) {
+      return
+    }
+
+    setProgress(0)
+    setDuration(nextTrack.duration || 0)
+    setCurrentTrackId(nextTrack.id)
+    setIsPlaying(true)
+    restoreSeekRef.current = 0
+  }
+
+  const handleSeek = (event) => {
+    const nextTime = Number(event.target.value)
+    const audio = audioRef.current
+    if (!audio) {
+      return
+    }
+
+    audio.currentTime = nextTime
+    setProgress(nextTime)
+    restoreSeekRef.current = nextTime
+  }
+
+  const handleVolumeChange = (event) => {
+    setVolume(Number(event.target.value))
+  }
+
+  const handleEqualizerChange = (index, value) => {
+    setEqualizerGains((prev) => prev.map((gain, gainIndex) => (gainIndex === index ? value : gain)))
+  }
+
+  const resetEqualizer = () => {
+    setEqualizerGains(Array(equalizerBands.length).fill(0))
+  }
+
+  const selectAudioOutput = async (deviceId) => {
+    setSelectedAudioOutputId(deviceId)
+    setSettingsOpen(true)
+
+    const audio = audioRef.current
+    if (audio?.setSinkId) {
+      try {
+        await audio.setSinkId(deviceId)
+      } catch {
+      showUploadNotice('Ses ÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â±kÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â± deÃƒâ€Ã…Â¸iÃƒâ€¦Ã…Â¸tirilemedi.')
+      }
+    }
+  }
+
+  const handleEditChange = (field, value) => {
+    setEditDraft((prev) => (prev ? { ...prev, [field]: value } : prev))
+  }
+
+  const openCoverPicker = () => {
+    if (!editTargetId) {
+      return
+    }
+
+    coverInputRef.current?.click()
+  }
+
+  const scrollToCoverStage = useCallback(() => {
+    coverStageRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [])
+
+  const refreshCurrentCover = useCallback(async () => {
+    if (!currentTrack) {
+      return
+    }
+
+    if (!window.confirm('KapaÃ„Å¸Ã„Â± yeniden aramak istediÃ„Å¸ine emin misin?')) {
+      return
+    }
+
+    try {
+      const remoteCoverUrl = await fetchRemoteCoverArt(currentTrack.title || '', currentTrack.artist || '')
+      if (!remoteCoverUrl) {
+        showUploadNotice('Yeni kapak bulunamadÃ„Â±.')
+        return
+      }
+
+      const coverTone = await extractDominantColor(remoteCoverUrl)
+      const coverName = `${currentTrack.artist || 'SanatÃƒÂ§Ã„Â±'} - ${currentTrack.title || 'ParÃƒÂ§a'}`
+      const cacheKey = `${normalizeArtistQuery(currentTrack.artist || '').toLowerCase()}::${normalizeArtistQuery(currentTrack.title || '').toLowerCase()}`
+      coverArtCacheRef.current[cacheKey] = remoteCoverUrl
+      saveJsonCache(COVER_ART_CACHE_KEY, coverArtCacheRef.current)
+
+      const nextUpdate = {
+        coverUrl: remoteCoverUrl,
+        coverRemoteUrl: remoteCoverUrl,
+        coverTone,
+        coverName,
+      }
+
+      if (tracks.some((track) => track.id === currentTrack.id)) {
+        updateTrack(currentTrack.id, nextUpdate)
+      }
+
+      showUploadNotice('Kapak gÃƒÂ¼ncellendi.')
+    } catch {
+      showUploadNotice('Kapak aranÃ„Â±rken bir sorun oluÃ…Å¸tu.')
+    }
+  }, [currentTrack, showUploadNotice, tracks, updateTrack])
+
+  const refreshCurrentArtistFacts = useCallback(async () => {
+    if (!currentTrack) {
+      return
+    }
+
+    if (!window.confirm('SanatÃƒÂ§Ã„Â± bilgisini yeniden aramak istediÃ„Å¸ine emin misin?')) {
+      return
+    }
+
+    setArtistFactsLoading(true)
+    try {
+      const facts = await fetchArtistFacts(currentTrack.artist || '')
+      artistFactsCacheRef.current[currentTrack.artist || ''] = facts
+      saveArtistFactsCache(artistFactsCacheRef.current)
+      setArtistFacts(facts)
+      showUploadNotice('SanatÃƒÂ§Ã„Â± bilgisi gÃƒÂ¼ncellendi.')
+    } catch {
+      showUploadNotice('SanatÃƒÂ§Ã„Â± bilgisi yenilenemedi.')
+    } finally {
+      setArtistFactsLoading(false)
+    }
+  }, [currentTrack, showUploadNotice])
+  const handleCoverSelect = (event) => {
+    const file = event.target.files?.[0]
+    if (!file) {
+      return
+    }
+
+    const coverUrl = URL.createObjectURL(file)
+    assetUrlsRef.current.push(coverUrl)
+    setPendingCover({ coverBlob: file, coverUrl, coverName: file.name })
+    event.target.value = ''
+  }
+
+  const handlePlaylistCoverSelect = async (event, target = 'create') => {
+    const file = event.target.files?.[0]
+    if (!file) {
+      return
+    }
+
+    try {
+      const coverUrl = await readFileAsDataUrl(file)
+      if (target === 'edit') {
+        setPlaylistEditCoverDraft(coverUrl)
+      } else {
+        setPlaylistCoverDraft(coverUrl)
+      }
+    } catch {
+      // Ignore invalid image files.
+    } finally {
+      event.target.value = ''
+    }
+  }
+
+  const saveTrackChanges = () => {
+    if (!editTargetId || !editDraft) {
+      return
+    }
+
+    const nextCover = pendingCover
+      ? {
+          coverBlob: pendingCover.coverBlob,
+          coverUrl: pendingCover.coverUrl,
+          coverName: pendingCover.coverName,
+          coverRemoteUrl: '',
+          coverTone: '',
+        }
+      : {}
+
+    updateTrack(editTargetId, {
+      title: editDraft.title.trim() || 'Bilinmeyen Sarki',
+      artist: editDraft.artist.trim() || 'Bilinmeyen Sanatci',
+      ...nextCover,
+    })
+
+    closeEditor()
+  }
+
+  const toggleTrackPlaylist = (playlistId, trackId) => {
+    setPlaylists((prev) =>
+      prev.map((playlist) => {
+        if (playlist.id !== playlistId) {
+          return playlist
+        }
+
+        const hasTrack = playlist.trackIds.includes(trackId)
+        return {
+          ...playlist,
+          trackIds: hasTrack
+            ? playlist.trackIds.filter((id) => id !== trackId)
+            : [...playlist.trackIds, trackId],
+        }
+      }),
+    )
+  }
+
+  const createPlaylist = () => {
+    const trimmed = playlistNameDraft.trim()
+    if (!trimmed) {
+      return
+    }
+
+    const newPlaylist = {
+      id: `playlist-${Date.now()}`,
+      name: trimmed,
+      trackIds: [],
+      color: playlistColorDraft,
+      coverUrl: playlistCoverDraft || '',
+    }
+
+    setPlaylists((prev) => [...prev, newPlaylist])
+    setSelectedCollectionId(newPlaylist.id)
+    setCreatingPlaylist(false)
+    setPlaylistNameDraft('')
+  }
+
+  const savePlaylistChanges = () => {
+    const nextName = playlistEditDraft.trim()
+    if (!editingPlaylistId || !nextName) {
+      return
+    }
+
+    setPlaylists((prev) =>
+      prev.map((playlist) =>
+        playlist.id === editingPlaylistId
+          ? {
+              ...playlist,
+              name: nextName,
+              color: playlistEditColorDraft,
+              coverUrl: playlistEditCoverDraft || '',
+            }
+          : playlist,
+      ),
+    )
+    closePlaylistEditor()
+  }
+
+  const deletePlaylist = (playlistId) => {
+    const playlist = playlists.find((item) => item.id === playlistId)
+    if (!playlist) {
+      return
+    }
+
+    const shouldDelete = window.confirm('Bu playlisti silmek istiyor musun?')
+    if (!shouldDelete) {
+      return
+    }
+
+    setPlaylists((prev) => prev.filter((item) => item.id !== playlistId))
+    if (selectedCollectionId === playlistId) {
+      setSelectedCollectionId('all')
+    }
+
+    if (editingPlaylistId === playlistId) {
+      closePlaylistEditor()
+    }
+  }
+
+  const toggleFavorite = (trackId) => {
+    const track = allTracks.find((item) => item.id === trackId)
+    if (!track) {
+      return
+    }
+
+    const nextFavoriteState = !track.isFavorite
+    setFavoriteTrackIds((prev) =>
+      nextFavoriteState ? Array.from(new Set([...prev, trackId])) : prev.filter((id) => id !== trackId),
+    )
+
+    if (track.source === 'drive') {
+      setServerTracks((prev) =>
+        prev.map((item) => (item.id === trackId ? { ...item, isFavorite: nextFavoriteState } : item)),
+      )
+      return
+    }
+
+    updateTrack(trackId, { isFavorite: nextFavoriteState })
+  }
+
+  const toggleCurrentTrackFavorite = () => {
+    if (!currentTrack) {
+      return
+    }
+
+    toggleFavorite(currentTrack.id)
+
+    if (dockFavoritePulseTimerRef.current) {
+      window.clearTimeout(dockFavoritePulseTimerRef.current)
+    }
+
+    setDockFavoritePulseId(currentTrack.id)
+    dockFavoritePulseTimerRef.current = window.setTimeout(() => {
+      setDockFavoritePulseId(null)
+    }, 220)
+  }
+
+  useEffect(() => {
+    return () => {
+      if (dockFavoritePulseTimerRef.current) {
+        window.clearTimeout(dockFavoritePulseTimerRef.current)
+      }
+    }
+  }, [])
+  const deleteTrack = async (trackId) => {
+    const track = tracks.find((item) => item.id === trackId)
+    if (!track) {
+      return
+    }
+
+    const shouldDelete = window.confirm('Bu parcayi silmek istiyor musun?')
+    if (!shouldDelete) {
+      return
+    }
+
+    releaseTrackResources(track)
+    deleteStoredTrack(trackId).catch(() => {})
+
+    setTracks((prev) => {
+      const deletionIndex = prev.findIndex((item) => item.id === trackId)
+      const next = prev.filter((item) => item.id !== trackId)
+      const activePlaylist =
+        selectedCollectionId === 'all'
+          ? null
+          : playlists.find((playlist) => playlist.id === selectedCollectionId) || null
+      const nextVisible =
+        !activePlaylist
+          ? next
+          : next.filter((item) => activePlaylist.trackIds.includes(item.id))
+
+      if (currentTrackId === trackId) {
+        const replacement =
+          nextVisible[deletionIndex] || nextVisible[deletionIndex - 1] || nextVisible[0] || next[0] || null
+        setCurrentTrackId(replacement?.id || null)
+        setProgress(0)
+        setDuration(replacement?.duration || 0)
+        setIsPlaying(Boolean(replacement))
+      }
+
+      if (editTargetId === trackId) {
+        closeEditor()
+      }
+
+      return next
+    })
+
+    setPlaylists((prev) =>
+      prev.map((playlist) => ({
+        ...playlist,
+        trackIds: playlist.trackIds.filter((id) => id !== trackId),
+      })),
+    )
+
+    setTrackMenuId(null)
+  }
+
+  const openTrackMenu = (trackId, anchorEl) => {
+    if (trackMenuId === trackId) {
+      setTrackMenuId(null)
+      setTrackMenuPosition(null)
+      return
+    }
+
+    const rect = anchorEl?.getBoundingClientRect()
+    const menuWidth = 280
+    const horizontalPadding = 12
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0
+    const left = rect
+      ? Math.min(
+          Math.max(rect.right - menuWidth, horizontalPadding),
+          Math.max(horizontalPadding, viewportWidth - menuWidth - horizontalPadding),
+        )
+      : horizontalPadding
+    const fitsBelow = rect ? rect.bottom + 240 < viewportHeight : true
+
+    setTrackMenuId(trackId)
+    setTrackMenuPosition(
+      rect
+        ? fitsBelow
+          ? {
+              position: 'fixed',
+              top: Math.min(rect.bottom + 8, viewportHeight - 260),
+              left,
+            }
+          : {
+              position: 'fixed',
+              bottom: Math.max(viewportHeight - rect.top + 8, 12),
+              left,
+            }
+        : {
+            position: 'fixed',
+            top: 96,
+            left: horizontalPadding,
+          },
+    )
+  }
+
+  const openPlaylistMenu = (trackId, anchorEl) => {
+    const rect = anchorEl?.getBoundingClientRect()
+    const menuWidth = 240
+    const horizontalPadding = 12
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0
+    const left = rect
+      ? Math.min(
+          Math.max(rect.left, horizontalPadding),
+          Math.max(horizontalPadding, viewportWidth - menuWidth - horizontalPadding),
+        )
+      : horizontalPadding
+    const fitsAbove = rect ? rect.top - 240 > 12 : true
+
+    setPlaylistMenuTrackId(trackId)
+    setPlaylistMenuPosition(
+      rect
+        ? fitsAbove
+          ? {
+              position: 'fixed',
+              top: Math.max(rect.top - 12, 12),
+              left,
+              transform: 'translateY(-100%)',
+            }
+          : {
+              position: 'fixed',
+              top: Math.min(rect.bottom + 12, viewportHeight - 24),
+              left,
+            }
+        : {
+            position: 'fixed',
+            bottom: 96,
+            left: horizontalPadding,
+          },
+    )
+    setDockPlaylistMenuOpen(true)
+    setTrackMenuId(null)
+    setTrackMenuPosition(null)
+  }
+
+  const toggleDockPlaylistMenu = (anchorEl) => {
+    if (dockPlaylistMenuOpen && playlistMenuPosition) {
+      setDockPlaylistMenuOpen(false)
+      setPlaylistMenuTrackId(null)
+      setPlaylistMenuPosition(null)
+      return
+    }
+
+    if (currentTrack) {
+      openPlaylistMenu(currentTrack.id, anchorEl)
+    }
+  }
+
+  const openTrackPlaylistMenu = (trackId, anchorEl) => {
+    openPlaylistMenu(trackId, anchorEl)
+  }
+
+  if (isMiniPlayerMode) {
+    return (
+      <div className={`mini-player-shell theme-${themeMode}`} style={themeVars} onClick={closeMenus}>
+        <audio ref={audioRef} />
+        <div
+          className="mini-player-card"
+          style={{
+            background: currentCoverTone || currentThemeColor,
+            '--cover-fg': currentCoverColors.fg,
+            '--cover-fg-soft': currentCoverColors.fgSoft,
+            '--cover-fg-muted': currentCoverColors.fgMuted,
+            '--mini-control-bg': fullscreenControlBg,
+            '--mini-control-border': fullscreenControlBorder,
+            '--mini-control-fg': currentCoverColors.fg,
+            '--mini-control-fg-soft': currentCoverColors.fgSoft,
+            '--mini-control-fg-muted': currentCoverColors.fgMuted,
+          }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button className="mini-player-restore" type="button" onClick={() => setAppMiniMode(false)} aria-label="Tam g?r?n?me d?n">
+            <Maximize2 size={14} />
+          </button>
+
+          <div className="mini-player-top">
+            <div className="mini-player-cover">
+              {getTrackDisplayUrl(currentTrack, 'thumb') ? (
+                <img src={getTrackDisplayUrl(currentTrack, 'thumb')} alt={`${currentTrack?.title || 'Par?a'} kapa??`} />
+              ) : (
+                <div className="mini-player-cover-fallback" style={{ background: currentTrack?.gradient || currentThemeColor }} />
+              )}
+            </div>
+
+            <div className="mini-player-copy">
+              <p className="eyebrow">?imdi ?al?yor</p>
+              <h2>{currentTrack?.title || 'Bir par?a se?'}</h2>
+              <span>{currentTrack?.artist || 'Sanat?? bilgisi'}</span>
+            </div>
+
+            <div className="mini-player-utility">
+              <button
+                className={`mini-player-volume-button ${miniVolumeOpen ? 'active' : ''}`}
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setMiniVolumeOpen((prev) => !prev)
+                }}
+                aria-label="Ses ayar?"
+              >
+                <Volume2 size={16} />
+              </button>
+
+              {miniVolumeOpen ? (
+                <div className="mini-player-volume-popover" onClick={(event) => event.stopPropagation()}>
+                  <input
+                    className="range mini-player-volume-range"
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    value={volume}
+                    onChange={handleVolumeChange}
+                    aria-label="Ses seviyesini ayarla"
+                  />
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="mini-player-controls">
+            <button className={`icon-button ${shuffleEnabled ? 'active' : ''}`} onClick={() => setShuffleEnabled((prev) => !prev)} aria-label="Kar???k ?al">
+              <Shuffle size={18} />
+            </button>
+            <button className="icon-button" onClick={restartTrack} aria-label="Ba?a al">
+              <Rewind size={18} />
+            </button>
+            <button className="play-button" onClick={togglePlayback} aria-label="Oynat">
+              {isPlaying && currentTrack ? <Pause size={24} /> : <Play size={24} />}
+            </button>
+            <button className="icon-button" onClick={stepTrack} aria-label="Sonraki">
+              <Forward size={18} />
+            </button>
+            <button className={`icon-button ${repeatEnabled ? 'active' : ''}`} onClick={() => setRepeatEnabled((prev) => !prev)} aria-label="Tekrarla">
+              <Repeat size={18} />
+            </button>
+          </div>
+
+          <div className="mini-player-progress">
+            <span className="time-badge time-badge--start">{formatTime(progress)}</span>
+            <input
+              className="range range-progress"
+              type="range"
+              min="0"
+              max={duration || 0}
+              step="0.1"
+              value={Math.min(progress, duration || 0)}
+              onChange={handleSeek}
+              disabled={!currentTrack}
+            />
+            <span className="time-badge time-badge--end">{formatTime(duration)}</span>
+          </div>
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div className={`app-shell theme-${themeMode}`} style={themeVars} onClick={closeMenus}>
+      <audio ref={audioRef} />
+
+      <input
+        ref={coverInputRef}
+        className="hidden-input"
+        type="file"
+        accept="image/*"
+        onChange={handleCoverSelect}
+      />
+
+      <MotionDiv
+        className="ambient ambient-left"
+        animate={{ opacity: [0.14, 0.22, 0.14] }}
+        transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut' }}
+      />
+      <MotionDiv
+        className="ambient ambient-right"
+        animate={{ opacity: [0.1, 0.18, 0.1] }}
+        transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut' }}
+      />
+
+      <header className="topbar">
+        <div className="topbar-brand">
+          <div className="topbar-logo-frame">
+            <img src={appLogo} alt="Music logo" className="topbar-logo" />
+          </div>
+          <h1>Music</h1>
+        </div>
+
+        <div className="topbar-actions">
+          <button className="icon-button topbar-icon-button" onClick={(event) => { event.stopPropagation(); setSettingsOpen(true) }} aria-label="Ayarlar">
+            <SlidersHorizontal size={18} />
+          </button>
+
+          <button className="upload-button" onClick={(event) => { event.stopPropagation(); openUploadPicker() }}>
+            <Upload size={18} />
+            Ekle
+          </button>
+        </div>
+
+          <input
+            ref={inputRef}
+            className="hidden-input"
+            type="file"
+            accept=".mp3,audio/*"
+            multiple
+            onChange={handleUpload}
+          />
+      </header>
+
+      <AnimatePresence>
+        {uploadNotice ? (
+          <MotionDiv
+            className="upload-notice"
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+          >
+            {uploadNotice}
+          </MotionDiv>
+        ) : null}
+
+        {settingsOpen ? (
+          <MotionDiv
+            className="modal-backdrop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setSettingsOpen(false)}
+          >
+            <MotionDiv
+              className="modal-card glass settings-modal"
+              initial={{ opacity: 0, y: 18, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 18, scale: 0.98 }}
+              transition={{ duration: 0.2 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="panel-header">
+                <div>
+                  <p className="eyebrow">Ayarlar</p>
+                  <h3>
+                    <SlidersHorizontal size={18} />
+                  Uygulama ayarlarÃƒâ€Ã‚Â±
+                  </h3>
+                </div>
+                <div className="editor-actions">
+                  <button className="mini-button ghost" onClick={() => setSettingsOpen(false)}>
+                    <X size={14} />
+                    Kapat
+                  </button>
+                </div>
+              </div>
+
+              <div className="settings-grid">
+                <section className="settings-section">
+                <h4>Ses ÃƒÆ’Ã¢â‚¬Â¡Ãƒâ€Ã‚Â±kÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±</h4>
+                <p>Buradan hoparlÃƒÆ’Ã‚Â¶r, kulaklÃƒâ€Ã‚Â±k ya da sanal ÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â±kÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸ aygÃƒâ€Ã‚Â±tÃƒâ€Ã‚Â±nÃƒâ€Ã‚Â± seÃƒÆ’Ã‚Â§ebilirsin.</p>
+                  <div className="settings-output-list">
+                    {!canSelectAudioOutput ? (
+                      <div className="menu-empty">Bu cihazda desteklenmiyor</div>
+                    ) : audioOutputs.length === 0 ? (
+                      <div className="menu-empty">ÃƒÆ’Ã¢â‚¬Â¡Ãƒâ€Ã‚Â±kÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸ aygÃƒâ€Ã‚Â±tÃƒâ€Ã‚Â± bulunamadÃƒâ€Ã‚Â±</div>
+                    ) : (
+                      audioOutputs.map((device, index) => (
+                        <button
+                          key={device.deviceId}
+                          className={`menu-item ${selectedAudioOutputId === device.deviceId ? 'selected' : ''}`}
+                          onClick={() => selectAudioOutput(device.deviceId)}
+                        >
+                          <Check size={14} className={selectedAudioOutputId === device.deviceId ? 'visible' : 'hidden-check'} />
+                            <span>{device.label || `ÃƒÆ’Ã¢â‚¬Â¡Ãƒâ€Ã‚Â±kÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸ ${index + 1}`}</span>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                </section>
+
+                <section className="settings-section settings-eq-section">
+                  <div className="settings-section-head">
+                    <div>
+                      <h4>Ekolayzer</h4>
+              <p>FrekanslarÃƒâ€Ã‚Â± hafifÃƒÆ’Ã‚Â§e yÃƒÆ’Ã‚Â¼kseltip azaltarak sesi Ãƒâ€¦Ã…Â¸ekillendirebilirsin.</p>
+                    </div>
+                    <button className="mini-button ghost" onClick={resetEqualizer}>
+                SÃƒâ€Ã‚Â±fÃƒâ€Ã‚Â±rla
+                    </button>
+                  </div>
+                  <div className="settings-eq-grid">
+                    {equalizerBands.map((band, index) => (
+                      <label key={band.key} className="eq-band">
+                        <span>{band.label}</span>
+                        <input
+                          className="range eq-range"
+                          type="range"
+                          min="-12"
+                          max="12"
+                          step="1"
+                          value={equalizerGains[index] || 0}
+                          onChange={(event) => handleEqualizerChange(index, Number(event.target.value))}
+                        />
+                        <strong>{(equalizerGains[index] || 0) > 0 ? `+${equalizerGains[index] || 0}` : equalizerGains[index] || 0} dB</strong>
+                      </label>
+                    ))}
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <h4>Tema</h4>
+              <p>ArayÃƒÆ’Ã‚Â¼z gÃƒÆ’Ã‚Â¶rÃƒÆ’Ã‚Â¼nÃƒÆ’Ã‚Â¼mÃƒÆ’Ã‚Â¼nÃƒÆ’Ã‚Â¼ seÃƒÆ’Ã‚Â§.</p>
+                  <div className="settings-theme-list">
+                    {[
+                      ['dark', 'Koyu'],
+                      ['gray', 'Grimsi'],
+                      ['light', 'AÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â±k'],
+                    ].map(([value, label]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        className={`menu-item ${themeMode === value ? 'selected' : ''}`}
+                        onClick={() => setThemeMode(value)}
+                      >
+                        <span>{label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <h4>Kapatma</h4>
+              <p>Kapat tuÃƒâ€¦Ã…Â¸una basÃƒâ€Ã‚Â±nca uygulamanÃƒâ€Ã‚Â±n ne yapacaÃƒâ€Ã…Â¸Ãƒâ€Ã‚Â±nÃƒâ€Ã‚Â± seÃƒÆ’Ã‚Â§.</p>
+                  <div className="settings-theme-list">
+                    {[
+                      ['tray', 'Arka planda kalsÃƒâ€Ã‚Â±n'],
+                      ['quit', 'Tamamen kapansÃƒâ€Ã‚Â±n'],
+                    ].map(([value, label]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        className={`menu-item ${closeBehavior === value ? 'selected' : ''}`}
+                        onClick={() => setCloseBehavior(value)}
+                      >
+                        <span>{label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <h4>Not</h4>
+              <p>Playlist ve favori durumlarÃƒâ€Ã‚Â± yerelde saklanÃƒâ€Ã‚Â±r.</p>
+              <p>Uygulama son ÃƒÆ’Ã‚Â§alÃƒâ€Ã‚Â±nan parÃƒÆ’Ã‚Â§ayÃƒâ€Ã‚Â± ve konumu hatÃƒâ€Ã‚Â±rlar.</p>
+                </section>
+              </div>
+            </MotionDiv>
+          </MotionDiv>
+        ) : null}
+
+        {addModalOpen ? (
+          <MotionDiv
+            className="modal-backdrop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={closeAddModal}
+          >
+            <MotionDiv
+              className="modal-card glass add-modal"
+              initial={{ opacity: 0, y: 18, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 18, scale: 0.98 }}
+              transition={{ duration: 0.2 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="panel-header">
+                <div>
+                  <p className="eyebrow">Ekle</p>
+                  <h3>
+                    <Plus size={18} />
+                    Dosya veya link
+                  </h3>
+                </div>
+                <div className="editor-actions">
+                  <button className="mini-button ghost" onClick={closeAddModal}>
+                    <X size={14} />
+                    Kapat
+                  </button>
+                </div>
+              </div>
+
+              {addMode === 'choose' ? (
+                <div className="add-choice-grid">
+                  <button
+                    className="add-choice-card"
+                    onClick={() => {
+                      setAddMode('file')
+                      inputRef.current?.click()
+                    }}
+                  >
+                    <FileUp size={20} />
+                    <strong>Dosya ekle</strong>
+                    <span>BilgisayarÃƒâ€Ã‚Â±ndaki MP3'leri otomatik okuyalÃƒâ€Ã‚Â±m.</span>
+                  </button>
+
+                  <button className="add-choice-card" onClick={() => setAddMode('link')}>
+                    <Link2 size={20} />
+                    <strong>Link ekle</strong>
+                    <span>Drive baÃƒâ€Ã…Â¸lantÃƒâ€Ã‚Â±sÃƒâ€Ã‚Â± ile ÃƒÆ’Ã‚Â§alsÃƒâ€Ã‚Â±n, baÃƒâ€¦Ã…Â¸lÃƒâ€Ã‚Â±k ve sanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â±yÃƒâ€Ã‚Â± sen gir.</span>
+                  </button>
+                </div>
+              ) : null}
+
+              {addMode === 'link' ? (
+                <div className="add-form">
+                  <label className="field">
+                    <span>Ãƒâ€¦Ã‚ÂarkÃƒâ€Ã‚Â± adÃƒâ€Ã‚Â±</span>
+                    <input
+                      type="text"
+                      value={linkDraft.title}
+                      onChange={(event) =>
+                        setLinkDraft((prev) => ({ ...prev, title: event.target.value }))
+                      }
+                      placeholder="Ãƒâ€¦Ã‚ÂarkÃƒâ€Ã‚Â± adÃƒâ€Ã‚Â±"
+                      autoFocus
+                    />
+                  </label>
+
+                  <label className="field">
+                    <span>SanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â±</span>
+                    <input
+                      type="text"
+                      value={linkDraft.artist}
+                      onChange={(event) =>
+                        setLinkDraft((prev) => ({ ...prev, artist: event.target.value }))
+                      }
+                      placeholder="SanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â± adÃƒâ€Ã‚Â±"
+                    />
+                  </label>
+
+                  <label className="field">
+                    <span>Drive baÃƒâ€Ã…Â¸lantÃƒâ€Ã‚Â±sÃƒâ€Ã‚Â±</span>
+                    <input
+                      type="text"
+                      value={linkDraft.audioUrl}
+                      onChange={(event) =>
+                        setLinkDraft((prev) => ({ ...prev, audioUrl: event.target.value }))
+                      }
+                      placeholder="https://drive.google.com/file/d/..."
+                    />
+                  </label>
+                  <p className="field-hint">
+                    Drive baÃƒâ€Ã…Â¸lantÃƒâ€Ã‚Â±sÃƒâ€Ã‚Â± ile ÃƒÆ’Ã‚Â§alsÃƒâ€Ã‚Â±n, baÃƒâ€¦Ã…Â¸lÃƒâ€Ã‚Â±k ve sanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â±yÃƒâ€Ã‚Â± sen gir.
+                  </p>
+
+                  <label className="field">
+                    <span>Kapak baÃƒâ€Ã…Â¸lantÃƒâ€Ã‚Â±sÃƒâ€Ã‚Â±</span>
+                    <input
+                      type="text"
+                      value={linkDraft.coverUrl}
+                      onChange={(event) =>
+                        setLinkDraft((prev) => ({ ...prev, coverUrl: event.target.value }))
+                      }
+                      placeholder="Ãƒâ€Ã‚Â°steÃƒâ€Ã…Â¸e baÃƒâ€Ã…Â¸lÃƒâ€Ã‚Â±"
+                    />
+                  </label>
+
+                  <div className="editor-actions">
+                    <button className="mini-button ghost" onClick={() => setAddMode('choose')}>
+                      Geri
+                    </button>
+                    <button className="mini-button primary" onClick={handleLinkAdd}>
+                      <Link2 size={14} />
+                      Linki ekle
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </MotionDiv>
+          </MotionDiv>
+        ) : null}
+      </AnimatePresence>
+
+      <div className="dashboard">
+        <MotionAside
+          className="library-panel glass"
+          initial={{ opacity: 0, x: -20 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ duration: 0.45 }}
+        >
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">KÃƒÆ’Ã‚Â¼tÃƒÆ’Ã‚Â¼phane</p>
+              <h3>
+                <ListMusic size={18} />
+                ParÃƒÆ’Ã‚Â§alar
+              </h3>
+              <span className="panel-subtitle">{activeCollectionLabel}</span>
+            </div>
+
+            <button className="mini-upload" onClick={(event) => { event.stopPropagation(); openAddModal() }}>
+                <Plus size={16} />
+              Ekle
+            </button>
+          </div>
+
+          <div className="library-body">
+            <aside className="playlist-rail">
+              <div className="playlist-rail-header">
+                <h4>Playlistler</h4>
+                <button className="mini-upload playlist-create-trigger" onClick={openPlaylistCreator}>
+                  <Plus size={16} />
+                  OluÃƒâ€¦Ã…Â¸tur
+                </button>
+              </div>
+
+              <div className="collection-switcher">
+                <button
+                  className={`collection-switcher-item ${selectedCollectionId === 'all' ? 'selected' : ''}`}
+                  onClick={() => setSelectedCollectionId('all')}
+                >
+                  <Check size={14} className={selectedCollectionId === 'all' ? 'visible' : 'hidden-check'} />
+                  <span>TÃƒÆ’Ã‚Â¼m parÃƒÆ’Ã‚Â§alar</span>
+                </button>
+
+                <button
+                  className={`collection-switcher-item ${selectedCollectionId === 'favorites' ? 'selected' : ''}`}
+                  onClick={() => setSelectedCollectionId('favorites')}
+                >
+                  <Check size={14} className={selectedCollectionId === 'favorites' ? 'visible' : 'hidden-check'} />
+                  <span>Favoriler</span>
+                </button>
+
+                  <button
+                    className={`collection-switcher-item ${selectedCollectionId === 'server' ? 'selected' : ''}`}
+                    onClick={() => setSelectedCollectionId('server')}
+                  >
+                    <Check size={14} className={selectedCollectionId === 'server' ? 'visible' : 'hidden-check'} />
+                    <span>Drive'dakiler</span>
+                  </button>
+              </div>
+
+              <div className="playlist-rail-list">
+                {playlists.length === 0 ? (
+                  <div className="menu-empty">HenÃƒÆ’Ã‚Â¼z playlist yok</div>
+                ) : (
+                  playlists.map((playlist) => {
+                    const isSelected = selectedCollectionId === playlist.id
+                    const coverLetter = playlist.name?.trim()?.[0]?.toUpperCase() || 'P'
+
+                    return (
+                      <div key={playlist.id} className={`playlist-rail-row ${isSelected ? 'selected' : ''}`}>
+                        <button
+                          className="playlist-rail-main"
+                          type="button"
+                          onClick={() => setSelectedCollectionId(playlist.id)}
+                        >
+                          <span className="playlist-rail-cover">
+                            {playlist.coverUrl ? (
+                              <img src={playlist.coverUrl} alt={`${playlist.name} kapaÃƒâ€Ã…Â¸Ãƒâ€Ã‚Â±`} />
+                            ) : (
+                              <span
+                                className="playlist-rail-cover-fallback"
+                                style={{ background: playlist.color || playlistColors[0] }}
+                              >
+                                {coverLetter}
+                              </span>
+                            )}
+                          </span>
+                          <span className="playlist-rail-copy">
+                            <strong>{playlist.name}</strong>
+                            <span>{playlist.trackIds.length} Ãƒâ€¦Ã…Â¸arkÃƒâ€Ã‚Â±</span>
+                          </span>
+                        </button>
+                        <div className="playlist-menu-actions">
+                          <button
+                            className="playlist-icon-button"
+                            type="button"
+                            onClick={() => openPlaylistEditor(playlist)}
+                            aria-label="Playlisti dÃƒÆ’Ã‚Â¼zenle"
+                          >
+                            <Edit3 size={14} />
+                          </button>
+                          <button
+                            className="playlist-icon-button danger"
+                            type="button"
+                            onClick={() => deletePlaylist(playlist.id)}
+                            aria-label="Playlisti sil"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  })
+                )}
+              </div>
+
+                <div className="server-section">
+                  <div className="playlist-rail-header">
+                    <h4>Drive'dakiler</h4>
+                  </div>
+                  <div className="server-section-copy">
+                    {DRIVE_MANIFEST_URL ? (
+                      <p>{serverTracks.length} ortak Ãƒâ€¦Ã…Â¸arkÃƒâ€Ã‚Â± Drive manifestinden ÃƒÆ’Ã‚Â§ekiliyor.</p>
+                    ) : (
+                      <p>Drive manifesti tanÃƒâ€Ã‚Â±mlanmadÃƒâ€Ã‚Â±.</p>
+                    )}
+                  </div>
+                </div>
+            </aside>
+
+            <div className="track-column">
+              <div className="playlist-section">
+                <div className="playlist-section-header">
+                  <h4>Ãƒâ€¦Ã‚ÂarkÃƒâ€Ã‚Â±lar</h4>
+                    <button className="mini-upload playlist-create-trigger" onClick={(event) => { event.stopPropagation(); openAddModal() }}>
+                      <Plus size={16} />
+                    Ekle
+                    </button>
+                </div>
+
+                {tracks.length === 0 ? (
+                    <button className="playlist-empty-card" onClick={(event) => { event.stopPropagation(); openAddModal() }}>
+                      <h4>HenÃƒÆ’Ã‚Â¼z Ãƒâ€¦Ã…Â¸arkÃƒâ€Ã‚Â± yok</h4>
+                      <p>Dosya veya Drive baÃƒâ€Ã…Â¸lantÃƒâ€Ã‚Â±sÃƒâ€Ã‚Â± ekleyebilirsin.</p>
+                    </button>
+                ) : (
+                  <div className="playlist-track-hint">
+                    <p>Toplam {tracks.length} Ãƒâ€¦Ã…Â¸arkÃƒâ€Ã‚Â± hazÃƒâ€Ã‚Â±r. Dosya veya baÃƒâ€Ã…Â¸lantÃƒâ€Ã‚Â± eklemek iÃƒÆ’Ã‚Â§in Ekle butonunu kullan.</p>
+                  </div>
+                )}
+              </div>
+
+              {visibleTracks.length === 0 ? (
+                <div className="empty-state compact">
+                  <div className="empty-orb" />
+                    <h4>HenÃƒÆ’Ã‚Â¼z parÃƒÆ’Ã‚Â§a yok</h4>
+                  <p>Dosya ya da link ekleyince burada temiz bir liste halinde gorunecek.</p>
+                </div>
+              ) : (
+              <div className="track-list">
+                  {visibleTracks.map((track, index) => {
+                const isActive = currentTrack?.id === track.id
+                const isEditing = editTargetId === track.id
+
+                return (
+                  <div
+                    key={track.id}
+                    className={`track-row ${
+                      isActive ? 'active' : ''
+                    } ${trackMenuId === track.id ? 'menu-open' : ''}`}
+                    onDoubleClick={() => {
+                      if (currentTrackId === track.id) {
+                        restartTrack()
+                        return
+                      }
+
+                      playTrack(track.id)
+                    }}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        playTrack(track.id)
+                      }
+                    }}
+                  >
+                      <div className="track-thumb">
+                        {getTrackDisplayUrl(track, 'thumb') ? (
+                          <img
+                            src={getTrackDisplayUrl(track, 'thumb')}
+                            alt={`${track.title} kapak`}
+                            className="track-thumb-image"
+                          />
+                      ) : (
+                        <div className="track-thumb-fallback" style={{ background: track.gradient }} />
+                      )}
+                    </div>
+
+                    <div className="track-info">
+                      <strong>{track.title}</strong>
+                      <span>{track.artist}</span>
+                    </div>
+
+                    <div className="track-meta">
+                      <span>{formatTime(track.duration)}</span>
+                      <small>{index + 1}</small>
+                    </div>
+
+                    <button
+                      className="track-order-trigger"
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        moveTrackUp(track.id)
+                      }}
+                      disabled={index === 0 || track.source === 'drive'}
+                title="ÃƒÆ’Ã…â€œste ÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â±k"
+                aria-label="ÃƒÆ’Ã…â€œste ÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â±k"
+                    >
+                      <ArrowUp size={14} />
+                    </button>
+
+                    <button
+                      className={`track-menu-trigger ${isEditing ? 'editing' : ''}`}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        openTrackMenu(track.id, event.currentTarget)
+                      }}
+                      aria-label="Parca menusu"
+                    >
+                      <MoreVertical size={16} />
+                    </button>
+                  </div>
+                )
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </MotionAside>
+
+        <MotionSection
+          className="player-panel glass"
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.5 }}
+        >
+          <div className="now-playing">
+            <AnimatePresence mode="wait">
+              <MotionDiv
+                key={currentTrack?.id || 'empty-cover'}
+                ref={coverStageRef}
+
+                className={`cover-stage ${currentCoverUrl ? 'with-cover' : 'banner-only'}`}
+                style={{
+                  background: currentCoverTone,
+                  '--cover-fg': currentCoverColors.fg,
+                  '--cover-fg-soft': currentCoverColors.fgSoft,
+                  '--cover-fg-muted': currentCoverColors.fgMuted,
+                }}
+                initial={{ opacity: 0.8, scale: 0.98 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 1.02 }}
+                transition={{ duration: 0.35 }}
+              >
+                {currentCoverUrl ? (
+                  <div className="cover-compact-layout">
+                    <div className="cover-art">
+                      <img className="cover-image" src={currentCoverUrl} alt={`${currentTrack?.title || 'ParÃƒÆ’Ã‚Â§a'} kapaÃƒâ€Ã…Â¸Ãƒâ€Ã‚Â±`} />
+                    </div>
+                    <div className="cover-details">
+                      <p className="eyebrow">Ãƒâ€¦Ã‚Âimdi ÃƒÆ’Ã‚Â§alÃƒâ€Ã‚Â±yor</p>
+                      <h2>{currentTrack?.title || 'Bir parÃƒÆ’Ã‚Â§a seÃƒÆ’Ã‚Â§'}</h2>
+                      <span>{currentTrack?.artist || 'SanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â± bilgisi'}</span>
+                      <div className="cover-actions">
+                        <button className="mini-button" type="button" onClick={refreshCurrentCover} disabled={!currentTrack}>
+                          <ImageIcon size={14} />
+                          KapaÃ„Å¸Ã„Â± deÃ„Å¸iÃ…Å¸tir
+                        </button>
+                        <button className="mini-button" type="button" onClick={refreshCurrentArtistFacts} disabled={!currentTrack}>
+                          <UserRound size={14} />
+                          SanatÃƒÂ§Ã„Â±yÃ„Â± yenile
+                        </button>
+                      </div>                      <div className="about-block">
+                        <p className="about-title">HakkÃƒâ€Ã‚Â±nda</p>
+                        {artistFactsLoading ? (
+                          <p className="about-text">SanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â± bilgisi ÃƒÆ’Ã‚Â§ekiliyor...</p>
+                        ) : artistFactLine ? (
+                          <p className="about-text">{artistFactLine}</p>
+                        ) : null}
+                        {artistFacts?.summary ? <p className="about-summary">{artistFacts.summary}</p> : null}
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="cover-overlay" />
+                    <div className="cover-copy">
+                      <p className="eyebrow">Simdi caliyor</p>
+                      <h2>{currentTrack?.title || 'Bir parca sec'}</h2>
+                      <span>{currentTrack?.artist || 'SanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â± bilgisi'}</span>
+                      <div className="cover-actions">
+                        <button className="mini-button" type="button" onClick={refreshCurrentCover} disabled={!currentTrack}>
+                          <ImageIcon size={14} />
+                          KapaÃ„Å¸Ã„Â± deÃ„Å¸iÃ…Å¸tir
+                        </button>
+                        <button className="mini-button" type="button" onClick={refreshCurrentArtistFacts} disabled={!currentTrack}>
+                          <UserRound size={14} />
+                          SanatÃƒÂ§Ã„Â±yÃ„Â± yenile
+                        </button>
+                      </div>                      <div className="about-block banner">
+                        <p className="about-title">HakkÃƒâ€Ã‚Â±nda</p>
+                        {artistFactsLoading ? (
+                          <p className="about-text">SanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â± bilgisi ÃƒÆ’Ã‚Â§ekiliyor...</p>
+                        ) : artistFactLine ? (
+                          <p className="about-text">{artistFactLine}</p>
+                        ) : null}
+                        {artistFacts?.summary ? <p className="about-summary">{artistFacts.summary}</p> : null}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </MotionDiv>
+            </AnimatePresence>
+
+            <div className="control-row">
+              <button className="icon-button" onClick={restartTrack} aria-label="Ba?a al">
+                <Rewind size={18} />
+              </button>
+
+              <button className="play-button" onClick={togglePlayback} aria-label="Oynat">
+                {isPlaying && currentTrack ? <Pause size={24} /> : <Play size={24} />}
+              </button>
+
+              <button className="icon-button" onClick={stepTrack} aria-label="Sonraki">
+                <Forward size={18} />
+              </button>
+            </div>
+
+            <div className="progress-block">
+              <input
+                className="range range-progress"
+                type="range"
+                min="0"
+                max={duration || 0}
+                step="0.1"
+                value={Math.min(progress, duration || 0)}
+                onChange={handleSeek}
+                disabled={!currentTrack}
+              />
+              <div className="time-row">
+                <span>{formatTime(progress)}</span>
+                <span>{formatTime(duration)}</span>
+              </div>
+            </div>
+
+            <div className="meta-strip">
+              <div>
+                <span>Koleksiyon</span>
+                <strong>{tracks.length} parca</strong>
+              </div>
+              <div>
+                <span>Toplam sure</span>
+                <strong>{formatTime(totalDuration)}</strong>
+              </div>
+              <div>
+                <span>Playlist</span>
+                <strong>{activeCollectionLabel}</strong>
+              </div>
+            </div>
+
+            <div className="volume-row">
+              <Volume2 size={18} />
+              <input
+                className="range"
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={volume}
+                onChange={handleVolumeChange}
+              />
+            </div>
+          </div>
+
+          <div className="editor-panel">
+            <div className="panel-header">
+              <div>
+                  <p className="eyebrow">DÃƒÆ’Ã‚Â¼zenleme</p>
+                <h3>
+                  <ImageIcon size={18} />
+                  ParÃƒÆ’Ã‚Â§a bilgisi
+                </h3>
+              </div>
+              <div className="editor-actions">
+                <button className="mini-button ghost" onClick={closeEditor}>
+                  <X size={14} />
+                  Kapat
+                </button>
+                <button className="mini-button" onClick={openCoverPicker} disabled={!editingTrack}>
+                  <ImageIcon size={14} />
+                  Kapak
+                </button>
+                <button className="mini-button primary" onClick={saveTrackChanges} disabled={!editDraft}>
+                  <Save size={14} />
+                  Kaydet
+                </button>
+              </div>
+            </div>
+
+            {editDraft && editingTrack ? (
+              <div className="editor-grid">
+                <div className="editor-cover">
+                  {getTrackCoverUrl(editingTrack, pendingCover) ? (
+                    <img
+                      src={getTrackCoverUrl(editingTrack, pendingCover)}
+                      alt="Kapak onizleme"
+                      className="editor-cover-image"
+                    />
+                  ) : (
+                    <div className="editor-cover-fallback" style={{ background: editingTrack.gradient }}>
+                      <ImageIcon size={26} />
+                    </div>
+                  )}
+                </div>
+
+                <label className="field">
+                  <span>Sarki adi</span>
+                  <input
+                    type="text"
+                    value={editDraft.title}
+                    onChange={(event) => handleEditChange('title', event.target.value)}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>
+                    <UserRound size={14} />
+                    SanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â±
+                  </span>
+                  <input
+                    type="text"
+                    value={editDraft.artist}
+                    onChange={(event) => handleEditChange('artist', event.target.value)}
+                  />
+                </label>
+
+                <div className="cover-meta">
+                  <span>Kapak dosyasÃƒâ€Ã‚Â±</span>
+                  <strong>{pendingCover?.coverName || editingTrack.coverName || 'Secilmedi'}</strong>
+                </div>
+              </div>
+            ) : (
+              <div className="editor-empty">
+                Bir parÃƒÆ’Ã‚Â§ayÃƒâ€Ã‚Â± seÃƒÆ’Ã‚Â§ip saÃƒâ€Ã…Â¸ ÃƒÆ’Ã‚Â¼stteki dÃƒÆ’Ã‚Â¼zenle butonuyla deÃƒâ€Ã…Â¸iÃƒâ€¦Ã…Â¸iklik yapabilirsin.
+              </div>
+            )}
+          </div>
+        </MotionSection>
+
+      <footer className="player-dock glass" style={themeVars} onClick={(event) => event.stopPropagation()}>
+        <div className="dock-track">
+          <div className="dock-thumb" onClick={scrollToCoverStage} role="button" tabIndex={0}>
+            {getTrackDisplayUrl(currentTrack, 'thumb') ? (
+              <img src={getTrackDisplayUrl(currentTrack, 'thumb')} alt={`${currentTrack.title} kapak`} className="track-thumb-image" />
+            ) : (
+              <div className="track-thumb-fallback" style={{ background: currentTrack?.gradient || gradients[0] }} />
+            )}
+          </div>
+
+          <div className="dock-meta" onClick={scrollToCoverStage} role="button" tabIndex={0}>
+            <div className="dock-meta-row">
+              <strong>{currentTrack?.title || 'Bir parÃƒÆ’Ã‚Â§a seÃƒÆ’Ã‚Â§'}</strong>
+              <div className="dock-actions">
+                <button
+                  className={`dock-icon-button ${currentTrack?.isFavorite ? 'active' : ''} ${dockFavoritePulseId === currentTrack?.id ? 'favorite-pulse' : ''}`}
+                  onClick={(event) => { event.stopPropagation(); toggleCurrentTrackFavorite() }}
+                  aria-label="Favori"
+                >
+                  <Heart size={16} className={currentTrack?.isFavorite ? 'active-heart' : ''} />
+                </button>
+                <button
+                  className="dock-icon-button"
+                  onClick={(event) => { event.stopPropagation(); currentTrack && toggleDockPlaylistMenu(event.currentTarget) }}
+                  aria-label="Playliste ekle"
+                >
+                  <ListMusic size={16} />
+                </button>
+              </div>
+            </div>
+            <span>{currentTrack?.artist || 'SanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â± bilgisi'}</span>
+          </div>
+        </div>
+
+        <div className="dock-center">
+          <div className="dock-controls">
+            <button className={`icon-button ${shuffleEnabled ? 'active' : ''}`} onClick={() => setShuffleEnabled((prev) => !prev)} aria-label="KarÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±k ÃƒÆ’Ã‚Â§al">
+              <Shuffle size={18} />
+            </button>
+
+            <button className="icon-button" onClick={restartTrack} aria-label="Ba?a al">
+              <Rewind size={18} />
+            </button>
+
+            <button className="play-button" onClick={togglePlayback} aria-label="Oynat">
+              {isPlaying && currentTrack ? <Pause size={24} /> : <Play size={24} />}
+            </button>
+
+            <button className="icon-button" onClick={stepTrack} aria-label="Sonraki">
+              <Forward size={18} />
+            </button>
+
+            <button className={`icon-button ${repeatEnabled ? 'active' : ''}`} onClick={() => setRepeatEnabled((prev) => !prev)} aria-label="Tekrarla">
+              <Repeat size={18} />
+            </button>
+          </div>
+
+          <div className="dock-progress dock-progress--compact">
+            <div className="dock-progress-row">
+              <span className="time-badge time-badge--start">{formatTime(progress)}</span>
+              <input
+                className="range range-progress"
+                type="range"
+                min="0"
+                max={duration || 0}
+                step="0.1"
+                value={Math.min(progress, duration || 0)}
+                onChange={handleSeek}
+                disabled={!currentTrack}
+              />
+              <span className="time-badge time-badge--end">{formatTime(duration)}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="dock-right">
+          <div className="dock-utility-row">
+            <button
+              className="dock-icon-button dock-fullscreen-button"
+              type="button"
+              onClick={openFullscreenTrack}
+              disabled={!currentTrack}
+              aria-label="Tam ekran"
+            >
+              <Maximize2 size={14} />
+            </button>
+            <div className="volume-row dock-volume-compact">
+              <Volume2 size={18} />
+              <input
+                className="range range-compact"
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={volume}
+                onChange={handleVolumeChange}
+              />
+            </div>
+          </div>
+        </div>
+      </footer>
+
+      {fullscreenTrackOpen && currentTrack ? createPortal(
+        <div className="fullscreen-track-backdrop" onClick={closeFullscreenTrack} onMouseMove={revealFullscreenControls}>
+          <div
+            className="fullscreen-track-panel"
+            style={{
+              background: currentCoverTone || currentThemeColor,
+              '--cover-fg': currentCoverColors.fg,
+              '--cover-fg-soft': currentCoverColors.fgSoft,
+              '--cover-fg-muted': currentCoverColors.fgMuted,
+              '--fullscreen-control-bg': fullscreenControlBg,
+              '--fullscreen-control-border': fullscreenControlBorder,
+              '--fullscreen-control-fg': currentCoverColors.fg,
+              '--fullscreen-control-fg-soft': currentCoverColors.fgSoft,
+              '--fullscreen-control-fg-muted': currentCoverColors.fgMuted,
+            }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button className="fullscreen-track-close" type="button" onClick={closeFullscreenTrack} aria-label="Kapat">
+              <Minimize2 size={16} />
+            </button>
+            <div className="fullscreen-track-cover">
+              {getTrackCoverUrl(currentTrack) ? (
+                <img src={getTrackCoverUrl(currentTrack)} alt="Kapak ÃƒÆ’Ã‚Â¶nizleme" />
+              ) : (
+                <div className="fullscreen-track-fallback" style={{ background: currentTrack.gradient || currentThemeColor }} />
+              )}
+            </div>
+            <div className="fullscreen-track-copy">
+              <h2>{currentTrack.title}</h2>
+              <p>{currentTrack.artist}</p>
+            </div>
+
+            <div className={`fullscreen-track-controls ${fullscreenControlsVisible ? 'visible' : ''}`}>
+              <div className="fullscreen-track-controls-bar">
+                <div className="fullscreen-track-controls-row">
+                  <button className={`icon-button ${shuffleEnabled ? 'active' : ''}`} onClick={() => setShuffleEnabled((prev) => !prev)} aria-label="KarÃƒâ€Ã‚Â±Ãƒâ€¦Ã…Â¸Ãƒâ€Ã‚Â±k ÃƒÆ’Ã‚Â§al">
+                    <Shuffle size={18} />
+                  </button>
+                  <button className="icon-button" onClick={restartTrack} aria-label="BaÃƒâ€¦Ã…Â¸a al">
+                    <Rewind size={18} />
+                  </button>
+                  <button className="play-button" onClick={togglePlayback} aria-label="Oynat">
+                    {isPlaying && currentTrack ? <Pause size={24} /> : <Play size={24} />}
+                  </button>
+                  <button className="icon-button" onClick={stepTrack} aria-label="Sonraki">
+                    <Forward size={18} />
+                  </button>
+                  <button className={`icon-button ${repeatEnabled ? 'active' : ''}`} onClick={() => setRepeatEnabled((prev) => !prev)} aria-label="Tekrarla">
+                    <Repeat size={18} />
+                  </button>
+                </div>
+                <div className="fullscreen-track-progress">
+                  <span className="time-badge time-badge--start">{formatTime(progress)}</span>
+                  <input
+                    className="range range-progress"
+                    type="range"
+                    min="0"
+                    max={duration || 0}
+                    step="0.1"
+                    value={Math.min(progress, duration || 0)}
+                    onChange={handleSeek}
+                    disabled={!currentTrack}
+                  />
+                  <span className="time-badge time-badge--end">{formatTime(duration)}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      ) : null}
+
+      <AnimatePresence>
+        {editDraft && editingTrack ? (
+          <MotionDiv
+            className="modal-backdrop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={closeEditor}
+          >
+            <MotionDiv
+              className="modal-card glass"
+              initial={{ opacity: 0, y: 18, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 18, scale: 0.98 }}
+              transition={{ duration: 0.2 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="panel-header">
+                <div>
+                <p className="eyebrow">DÃƒÆ’Ã‚Â¼zenleme</p>
+                  <h3>
+                    <ImageIcon size={18} />
+                  ParÃƒÆ’Ã‚Â§a bilgisi
+                  </h3>
+                </div>
+                <div className="editor-actions">
+                  <button className="mini-button ghost" onClick={closeEditor}>
+                    <X size={14} />
+                    Kapat
+                  </button>
+                  <button className="mini-button" onClick={openCoverPicker} disabled={!editingTrack}>
+                    <ImageIcon size={14} />
+                    Kapak
+                  </button>
+                  <button className="mini-button primary" onClick={saveTrackChanges} disabled={!editDraft}>
+                    <Save size={14} />
+                    Kaydet
+                  </button>
+                </div>
+              </div>
+
+              <div className="editor-grid">
+                <div className="editor-cover">
+                  {getTrackCoverUrl(editingTrack, pendingCover) ? (
+                    <img
+                      src={getTrackCoverUrl(editingTrack, pendingCover)}
+                      alt="Kapak ÃƒÆ’Ã‚Â¶nizleme"
+                      className="editor-cover-image"
+                    />
+                  ) : (
+                    <div className="editor-cover-fallback" style={{ background: editingTrack.gradient }}>
+                      <ImageIcon size={26} />
+                    </div>
+                  )}
+                </div>
+
+                <label className="field">
+                  <span>Ãƒâ€¦Ã‚ÂarkÃƒâ€Ã‚Â± adÃƒâ€Ã‚Â±</span>
+                  <input
+                    type="text"
+                    value={editDraft.title}
+                    onChange={(event) => handleEditChange('title', event.target.value)}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>
+                    <UserRound size={14} />
+                    SanatÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â±
+                  </span>
+                  <input
+                    type="text"
+                    value={editDraft.artist}
+                    onChange={(event) => handleEditChange('artist', event.target.value)}
+                  />
+                </label>
+
+                <div className="cover-meta">
+                  <strong>{pendingCover?.coverName || editingTrack.coverName || 'SeÃƒÆ’Ã‚Â§ilmedi'}</strong>
+                  <strong>{pendingCover?.coverName || editingTrack.coverName || 'SeÃƒÆ’Ã‚Â§ilmedi'}</strong>
+                </div>
+              </div>
+            </MotionDiv>
+          </MotionDiv>
+        ) : null}
+
+        {creatingPlaylist ? (
+          <MotionDiv
+            className="modal-backdrop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={closePlaylistCreator}
+          >
+            <MotionDiv
+              className="modal-card glass"
+              initial={{ opacity: 0, y: 18, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 18, scale: 0.98 }}
+              transition={{ duration: 0.2 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <input
+                ref={playlistCoverInputRef}
+                className="hidden-input"
+                type="file"
+                accept="image/*"
+                onChange={(event) => handlePlaylistCoverSelect(event, 'create')}
+              />
+              <div className="panel-header">
+                <div>
+                  <p className="eyebrow">Playlist</p>
+                  <h3>
+                    <ListMusic size={18} />
+                    Yeni playlist
+                  </h3>
+                </div>
+                <div className="editor-actions">
+                  <button className="mini-button ghost" onClick={closePlaylistCreator}>
+                    <X size={14} />
+                    Kapat
+                  </button>
+                  <button className="mini-button primary" onClick={createPlaylist} disabled={!playlistNameDraft.trim()}>
+                    <Plus size={14} />
+                  OluÃƒâ€¦Ã…Â¸tur
+                  </button>
+                </div>
+              </div>
+
+              <label className="field">
+                <span>Playlist adÃƒâ€Ã‚Â±</span>
+                <input
+                  type="text"
+                  value={playlistNameDraft}
+                  onChange={(event) => setPlaylistNameDraft(event.target.value)}
+                  placeholder="ÃƒÆ’Ã¢â‚¬â€œrneÃƒâ€Ã…Â¸in: Gece listesi"
+                  autoFocus
+                />
+              </label>
+
+              <div className="playlist-cover-editor">
+                <div className="editor-cover">
+                  {playlistCoverDraft ? (
+                    <img src={playlistCoverDraft} alt="Playlist kapaÃƒâ€Ã…Â¸Ãƒâ€Ã‚Â± ÃƒÆ’Ã‚Â¶nizleme" className="editor-cover-image" />
+                  ) : (
+                    <div className="editor-cover-fallback" style={{ background: playlistColorDraft }}>
+                      <ListMusic size={26} />
+                    </div>
+                  )}
+                </div>
+
+                <div className="cover-meta">
+                  <span>Kapak gÃƒÆ’Ã‚Â¶rseli</span>
+                  <strong>{playlistCoverDraft ? 'SeÃƒÆ’Ã‚Â§ildi' : 'SeÃƒÆ’Ã‚Â§ilmedi'}</strong>
+                </div>
+
+                <button className="mini-button" onClick={() => playlistCoverInputRef.current?.click()}>
+                  <ImageIcon size={14} />
+                  Kapak ekle
+                </button>
+              </div>
+
+              <div className="color-picker">
+                <span>Renk</span>
+                <div className="color-swatch-row">
+                  {playlistColors.map((color) => (
+                    <button
+                      key={color}
+                      type="button"
+                      className={`color-swatch ${playlistColorDraft === color ? 'selected' : ''}`}
+                      style={{ background: color }}
+                      onClick={() => setPlaylistColorDraft(color)}
+                      aria-label={`Renk ${color}`}
+                    />
+                  ))}
+                </div>
+              </div>
+            </MotionDiv>
+          </MotionDiv>
+        ) : null}
+
+        {editingPlaylistId ? (
+          <MotionDiv
+            className="modal-backdrop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={closePlaylistEditor}
+          >
+            <MotionDiv
+              className="modal-card glass"
+              initial={{ opacity: 0, y: 18, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 18, scale: 0.98 }}
+              transition={{ duration: 0.2 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <input
+                ref={playlistEditCoverInputRef}
+                className="hidden-input"
+                type="file"
+                accept="image/*"
+                onChange={(event) => handlePlaylistCoverSelect(event, 'edit')}
+              />
+              <div className="panel-header">
+                <div>
+                  <p className="eyebrow">Playlist</p>
+                  <h3>
+                    <ListMusic size={18} />
+                Playlist dÃƒÆ’Ã‚Â¼zenle
+                  </h3>
+                </div>
+                <div className="editor-actions">
+                  <button className="mini-button ghost" onClick={closePlaylistEditor}>
+                    <X size={14} />
+                    Kapat
+                  </button>
+                  <button
+                    className="mini-button primary"
+                    onClick={savePlaylistChanges}
+                    disabled={!playlistEditDraft.trim()}
+                  >
+                    <Save size={14} />
+                    Kaydet
+                  </button>
+                </div>
+              </div>
+
+              <label className="field">
+                <span>Playlist adÃƒâ€Ã‚Â±</span>
+                <input
+                  type="text"
+                  value={playlistEditDraft}
+                  onChange={(event) => setPlaylistEditDraft(event.target.value)}
+                  autoFocus
+                />
+              </label>
+
+              <div className="playlist-cover-editor">
+                <div className="editor-cover">
+                  {playlistEditCoverDraft ? (
+                    <img
+                      src={playlistEditCoverDraft}
+                    alt="Playlist kapaÃƒâ€Ã…Â¸Ãƒâ€Ã‚Â± ÃƒÆ’Ã‚Â¶nizleme"
+                      className="editor-cover-image"
+                    />
+                  ) : (
+                    <div className="editor-cover-fallback" style={{ background: playlistEditColorDraft }}>
+                      <ListMusic size={26} />
+                    </div>
+                  )}
+                </div>
+
+                <div className="cover-meta">
+                  <span>Kapak gÃƒÆ’Ã‚Â¶rseli</span>
+                  <strong>{playlistEditCoverDraft ? 'SeÃƒÆ’Ã‚Â§ildi' : 'SeÃƒÆ’Ã‚Â§ilmedi'}</strong>
+                </div>
+
+                <button className="mini-button" onClick={() => playlistEditCoverInputRef.current?.click()}>
+                  <ImageIcon size={14} />
+                  Kapak ekle
+                </button>
+              </div>
+
+              <div className="color-picker">
+                <span>Renk</span>
+                <div className="color-swatch-row">
+                  {playlistColors.map((color) => (
+                    <button
+                      key={color}
+                      type="button"
+                      className={`color-swatch ${playlistEditColorDraft === color ? 'selected' : ''}`}
+                      style={{ background: color }}
+                      onClick={() => setPlaylistEditColorDraft(color)}
+                      aria-label={`Renk ${color}`}
+                    />
+                  ))}
+                </div>
+              </div>
+            </MotionDiv>
+          </MotionDiv>
+        ) : null}
+      </AnimatePresence>
+      </div>
+
+      {dockPlaylistMenuOpen && playlistMenuTrackId && playlistMenuPosition
+        ? createPortal(
+            <div
+              className="dock-playlist-menu dock-playlist-menu--portal"
+              style={playlistMenuPosition}
+              onClick={(event) => event.stopPropagation()}
+            >
+              {(() => {
+                const activeTrack = allTracks.find((track) => track.id === playlistMenuTrackId)
+
+                return playlists.length === 0 ? (
+                  <div className="menu-empty">HenÃƒÆ’Ã‚Â¼z playlist yok</div>
+                ) : (
+                  playlists.map((playlist) => {
+                    const inPlaylist = activeTrack ? playlist.trackIds.includes(activeTrack.id) : false
+                    return (
+                      <button
+                        key={playlist.id}
+                        className={`menu-item playlist-menu-entry ${inPlaylist ? 'selected' : ''}`}
+                        onClick={() => activeTrack && toggleTrackPlaylist(playlist.id, activeTrack.id)}
+                      >
+                        <span className="playlist-menu-cover">
+                          {playlist.coverUrl ? (
+                            <img src={playlist.coverUrl} alt="" className="playlist-menu-cover-image" />
+                          ) : (
+                            <span
+                              className="playlist-menu-cover-fallback"
+                              style={{ background: playlist.color || currentThemeColor }}
+                            >
+                              <ListMusic size={12} />
+                            </span>
+                          )}
+                        </span>
+                        <span className="playlist-menu-copy">
+                          <strong>{playlist.name}</strong>
+                    <small>{playlist.trackIds.length} Ãƒâ€¦Ã…Â¸arkÃƒâ€Ã‚Â±</small>
+                        </span>
+                        <Check size={14} className={inPlaylist ? 'visible' : 'hidden-check'} />
+                      </button>
+                    )
+                  })
+                )
+              })()}
+            </div>,
+            document.body,
+          )
+        : null}
+
+      {trackMenuId && trackMenuPosition
+        ? createPortal(
+            <div
+              className="track-menu track-menu--portal"
+              style={trackMenuPosition}
+              onClick={(event) => event.stopPropagation()}
+            >
+              {(() => {
+                const track = allTracks.find((item) => item.id === trackMenuId)
+                if (!track) {
+                  return null
+                }
+
+                return (
+                  <>
+                    {track.source !== 'drive' ? (
+                      <button
+                        className="menu-item"
+                        onClick={() => {
+                          openEditor(track)
+                          setTrackMenuId(null)
+                          setTrackMenuPosition(null)
+                        }}
+                      >
+                        <ImageIcon size={14} />
+                      DÃƒÆ’Ã‚Â¼zenle
+                      </button>
+                    ) : null}
+                    <button className="menu-item" onClick={() => toggleFavorite(track.id)}>
+                      <Heart size={14} className={track.isFavorite ? 'active-heart' : ''} />
+                      {track.isFavorite ? 'Favoriden ÃƒÆ’Ã‚Â§Ãƒâ€Ã‚Â±kar' : 'Favorile'}
+                    </button>
+                    <button className="menu-item" onClick={() => searchYouTube(track)}>
+                      <Youtube size={14} />
+                      YouTube'da ara
+                    </button>
+                    <button className="menu-item" onClick={(event) => openTrackPlaylistMenu(track.id, event.currentTarget)}>
+                      <ListMusic size={14} />
+                      Playliste ekle
+                    </button>
+                    {track.source !== 'drive' ? (
+                      <button className="menu-item danger" onClick={() => deleteTrack(track.id)}>
+                        <Trash2 size={14} />
+                        Sil
+                      </button>
+                    ) : null}
+                  </>
+                )
+              })()}
+            </div>,
+            document.body,
+          )
+        : null}
+    </div>
+  )
+}
+
+export default App
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

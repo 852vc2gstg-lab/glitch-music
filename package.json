@@ -1,0 +1,84 @@
+{
+    "name": "music",
+    "private": true,
+    "version": "0.4.33",
+    "description": "Ghxsty Music desktop player",
+    "author": "Ghxsty",
+    "type": "module",
+    "main": "electron/main.js",
+    "scripts": {
+        "dev": "vite",
+        "desktop": "concurrently -k \"npm:dev\" \"npm:electron\"",
+        "admin": "concurrently -k \"npm:dev\" \"npm:admin-electron\"",
+        "admin-electron": "wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 OPEN_ADMIN=true DISCORD_CLIENT_ID=1493213707864510464 electron electron/main.js",
+        "electron": "wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 DISCORD_CLIENT_ID=1493213707864510464 electron electron/main.js",
+        "start": "cross-env DISCORD_CLIENT_ID=1493213707864510464 electron electron/main.js",
+        "build": "vite build --configLoader native",
+        "clean:artifacts": "node -e \"import('node:fs').then(fs=>{['build','release'].forEach(d=>fs.rmSync(d,{recursive:true,force:true}))})\"",
+        "dist": "npm run build && electron-builder --win nsis",
+        "dist:github": "npm run build && electron-builder --win nsis --publish always",
+        "dist:clean": "npm run clean:artifacts && npm run dist",
+        "lint": "eslint .",
+        "preview": "vite preview"
+    },
+    "dependencies": {
+        "discord-rpc": "^4.0.1",
+        "electron-updater": "^6.8.3",
+        "framer-motion": "^12.23.24",
+        "lucide-react": "^0.554.0",
+        "music-metadata-browser": "^2.5.11",
+        "react": "^19.2.4",
+        "react-dom": "^19.2.4"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.39.4",
+        "@types/react": "^19.2.14",
+        "@types/react-dom": "^19.2.3",
+        "@vitejs/plugin-react": "^6.0.1",
+        "concurrently": "^9.2.1",
+        "cross-env": "^10.1.0",
+        "electron": "^41.2.1",
+        "electron-builder": "^26.8.1",
+        "eslint": "^9.39.4",
+        "eslint-plugin-react-hooks": "^7.1.1",
+        "eslint-plugin-react-refresh": "^0.5.2",
+        "globals": "^17.4.0",
+        "png-to-ico": "^3.0.1",
+        "vite": "^8.0.4",
+        "wait-on": "^9.0.5"
+    },
+    "build": {
+        "appId": "com.ghxsty.music",
+        "productName": "Music",
+        "executableName": "Music",
+        "artifactName": "Music-Setup-${version}.${ext}",
+        "compression": "normal",
+        "asar": true,
+        "directories": {
+            "output": "release"
+        },
+        "files": [
+            "build/**/*",
+            "electron/**/*",
+            "package.json"
+        ],
+        "win": {
+            "target": "nsis",
+            "icon": "public/logo.ico"
+        },
+        "nsis": {
+            "oneClick": false,
+            "allowToChangeInstallationDirectory": true,
+            "createDesktopShortcut": true,
+            "createStartMenuShortcut": true,
+            "installerIcon": "public/logo.ico",
+            "uninstallerIcon": "public/logo.ico"
+        },
+        "publish": {
+            "provider": "github",
+            "owner": "${env.GH_OWNER}",
+            "repo": "${env.GH_REPO}",
+            "releaseType": "release"
+        }
+    }
+}
