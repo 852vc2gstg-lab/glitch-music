@@ -73,3 +73,68 @@ npm run dist:github
 This uploads installer + update metadata (`latest.yml`) to your GitHub Release.
 Other installed users will receive update notifications automatically.
 
+## Code signing (Windows)
+
+Unsigned installers can trigger antivirus false positives. For best trust, build signed releases.
+
+Electron Builder already supports this via environment variables.
+
+### Option A (recommended): PFX file
+
+```powershell
+$env:CSC_LINK="C:\path\to\codesign.pfx"
+$env:CSC_KEY_PASSWORD="YOUR_PFX_PASSWORD"
+```
+
+Then run:
+
+```powershell
+npm run dist:signed
+```
+
+For GitHub release + signed installer:
+
+```powershell
+npm run dist:github:signed
+```
+
+### Option B: base64 certificate in CI
+
+If you use CI, `CSC_LINK` can be a base64 string of your PFX file and `CSC_KEY_PASSWORD` remains the PFX password.
+
+### Verify signature
+
+After build:
+
+```powershell
+Get-AuthenticodeSignature ".\release\Music-Setup-<version>.exe"
+```
+
+`Status` should be `Valid`.
+
+## In-app error report to Discord (Webhook-only)
+
+The app can send user error reports from the Notifications panel (`Hata bildir`) to a Discord channel as an embed.
+
+### Option 1: runtime env (development)
+
+```powershell
+$env:DISCORD_ERROR_WEBHOOK_URL="https://discord.com/api/webhooks/...."
+```
+
+### Option 2: built-in webhook (shared release without server)
+
+Set `BUILTIN_DISCORD_ERROR_WEBHOOK_URL` in:
+
+- `electron/main.js`
+
+Then build and distribute. Users can send reports without any extra server.
+
+### Optional fallback API relay
+
+```powershell
+$env:VITE_API_BASE="https://YOUR_SERVER_DOMAIN"
+```
+
+If bridge/webhook is unavailable, the app can also use `POST /api/report-issue`.
+

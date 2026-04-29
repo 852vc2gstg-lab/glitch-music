@@ -1,7 +1,7 @@
 {
     "name": "music",
     "private": true,
-    "version": "0.4.33",
+    "version": "0.4.90",
     "description": "Ghxsty Music desktop player",
     "author": "Ghxsty",
     "type": "module",
@@ -15,8 +15,11 @@
         "start": "cross-env DISCORD_CLIENT_ID=1493213707864510464 electron electron/main.js",
         "build": "vite build --configLoader native",
         "clean:artifacts": "node -e \"import('node:fs').then(fs=>{['build','release'].forEach(d=>fs.rmSync(d,{recursive:true,force:true}))})\"",
-        "dist": "npm run build && electron-builder --win nsis",
+        "dist": "npm run build && electron-builder --win",
+        "dist:linux": "npm run build && electron-builder --linux AppImage deb",
+        "dist:signed": "npm run build && electron-builder --win -c.forceCodeSigning=true",
         "dist:github": "npm run build && electron-builder --win nsis --publish always",
+        "dist:github:signed": "npm run build && electron-builder --win nsis --publish always -c.forceCodeSigning=true",
         "dist:clean": "npm run clean:artifacts && npm run dist",
         "lint": "eslint .",
         "preview": "vite preview"
@@ -47,6 +50,10 @@
         "vite": "^8.0.4",
         "wait-on": "^9.0.5"
     },
+    "overrides": {
+        "music-metadata": "11.12.3",
+        "file-type": "22.0.1"
+    },
     "build": {
         "appId": "com.ghxsty.music",
         "productName": "Music",
@@ -62,9 +69,30 @@
             "electron/**/*",
             "package.json"
         ],
+        "extraResources": [
+            {
+                "from": "vendor/yt-dlp.exe",
+                "to": "bin/yt-dlp.exe"
+            },
+            {
+                "from": "vendor/ffmpeg.exe",
+                "to": "bin/ffmpeg.exe"
+            }
+        ],
         "win": {
-            "target": "nsis",
+            "target": [
+                "nsis",
+                "msi"
+            ],
             "icon": "public/logo.ico"
+        },
+        "linux": {
+            "target": [
+                "AppImage",
+                "deb"
+            ],
+            "category": "AudioVideo",
+            "icon": "public/logo.png"
         },
         "nsis": {
             "oneClick": false,
@@ -72,7 +100,15 @@
             "createDesktopShortcut": true,
             "createStartMenuShortcut": true,
             "installerIcon": "public/logo.ico",
-            "uninstallerIcon": "public/logo.ico"
+            "uninstallerIcon": "public/logo.ico",
+            "installerHeaderIcon": "public/logo.ico",
+            "installerSidebar": "build/installer-sidebar.bmp",
+            "uninstallerSidebar": "build/installer-sidebar.bmp",
+            "installerHeader": "build/installer-header.bmp"
+        },
+        "msi": {
+            "perMachine": false,
+            "createDesktopShortcut": true
         },
         "publish": {
             "provider": "github",

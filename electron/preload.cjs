@@ -37,11 +37,15 @@ contextBridge.exposeInMainWorld('novaPlayer', {
   exportLibrary: (payload) => ipcRenderer.invoke('library:export', payload),
   downloadRemoteAsset: (payload) => ipcRenderer.invoke('library:download-remote', payload),
   downloadRemoteAssetToLibrary: (payload) => ipcRenderer.invoke('library:download-remote-to-library', payload),
+  downloadLinkToLibrary: (payload) => ipcRenderer.invoke('library:download-link-to-library', payload),
+  searchYoutube: (payload) => ipcRenderer.invoke('library:search-youtube', payload),
+  resolveLocalTrackUrls: (payload) => ipcRenderer.invoke('library:resolve-local-track-urls', payload),
   controlDownload: (payload) => ipcRenderer.invoke('library:control-download', payload),
   getUpdaterState: () => ipcRenderer.invoke('updater:get-state'),
   checkForUpdates: () => ipcRenderer.invoke('updater:check'),
   downloadUpdate: () => ipcRenderer.invoke('updater:download'),
   installUpdate: () => ipcRenderer.invoke('updater:install'),
+  reportIssue: (payload) => ipcRenderer.invoke('report:issue', payload),
   onUpdaterEvent: (callback) => {
     if (typeof callback !== 'function') {
       return () => {}

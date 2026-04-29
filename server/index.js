@@ -16,6 +16,7 @@ const MEDIA_DIR = path.join(__dirname, 'media')
 const AUDIO_DIR = path.join(MEDIA_DIR, 'audio')
 const COVER_DIR = path.join(MEDIA_DIR, 'covers')
 const DB_FILE = path.join(DATA_DIR, 'library.json')
+const DISCORD_ERROR_WEBHOOK_URL = String(process.env.DISCORD_ERROR_WEBHOOK_URL || '').trim()
 
 const mimeTypes = {
   '.mp3': 'audio/mpeg',
@@ -67,6 +68,18 @@ const sendJson = (res, statusCode, payload, extraHeaders = {}) => {
     ...extraHeaders,
   })
   res.end(JSON.stringify(payload))
+}
+
+const readJsonBody = async (req) => {
+  const chunks = []
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+  }
+  const raw = Buffer.concat(chunks).toString('utf8').trim()
+  if (!raw) {
+    return {}
+  }
+  return JSON.parse(raw)
 }
 
 const getOrigin = (req) => {
@@ -162,6 +175,83 @@ const serveMedia = async (req, res, folder, filename) => {
   createReadStream(filePath).pipe(res)
 }
 
+const handleReportIssue = async (req, res) => {
+  if (!DISCORD_ERROR_WEBHOOK_URL) {
+    sendJson(res, 503, { ok: false, error: 'webhook_missing' })
+    return
+  }
+
+  let body = {}
+  try {
+    body = await readJsonBody(req)
+  } catch {
+    sendJson(res, 400, { ok: false, error: 'invalid_json' })
+    return
+  }
+
+  const title = String(body?.title || '').trim().slice(0, 220)
+  const subject = String(body?.subject || '').trim().slice(0, 420)
+  const description = String(body?.description || '').trim().slice(0, 1600)
+  const context = body?.context && typeof body.context === 'object' ? body.context : {}
+
+  if (!title || !subject || !description) {
+    sendJson(res, 400, { ok: false, error: 'title_subject_description_required' })
+    return
+  }
+
+  const contextJson = JSON.stringify(context, null, 2)
+  const contextPreview = contextJson.length > 1700 ? `${contextJson.slice(0, 1700)}…` : contextJson
+
+  const payload = {
+    username: 'Ghxsty Music Hata Botu',
+    embeds: [
+      {
+        title,
+        description: description.slice(0, 4096),
+        color: 0xef4444,
+        timestamp: new Date().toISOString(),
+        fields: [
+          {
+            name: 'Konu',
+            value: subject || 'Belirtilmedi',
+          },
+          {
+            name: 'Platform',
+            value: String(context?.platform || 'unknown'),
+            inline: true,
+          },
+          {
+            name: 'App sürümü',
+            value: String(context?.appVersion || 'unknown'),
+            inline: true,
+          },
+          {
+            name: 'Bağlam',
+            value: `\`\`\`json\n${contextPreview || '{}'}\n\`\`\``,
+          },
+        ],
+      },
+    ],
+  }
+
+  try {
+    const response = await fetch(DISCORD_ERROR_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+
+    if (!response.ok) {
+      sendJson(res, 502, { ok: false, error: `discord_webhook_failed_${response.status}` })
+      return
+    }
+
+    sendJson(res, 200, { ok: true })
+  } catch (error) {
+    sendJson(res, 500, { ok: false, error: 'discord_webhook_network_error', message: String(error?.message || error) })
+  }
+}
+
 const requestListener = async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
 
@@ -192,6 +282,11 @@ const requestListener = async (req, res) => {
     } catch (error) {
       sendJson(res, 500, { error: 'upload_failed', message: error?.message || String(error) })
     }
+    return
+  }
+
+  if (url.pathname === '/api/report-issue' && req.method === 'POST') {
+    await handleReportIssue(req, res)
     return
   }
 

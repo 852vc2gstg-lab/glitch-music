@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom'
 import {
   BarChart3,
   Bell,
+  Bug,
   Check,
   Download,
   FileUp,
@@ -25,6 +26,7 @@ import {
   Plus,
   Shuffle,
   Rewind,
+  RotateCcw,
   Save,
   Trash2,
   Upload,
@@ -110,6 +112,13 @@ const equalizerBands = [
   { key: 'treble', label: 'Tiz', type: 'highshelf', frequency: 10500, q: 0.7 },
 ]
 
+// Spotify-benzeri: düşüklerde daha kontrollü, üst seviyede daha hassas.
+const VOLUME_TAPER_POWER = 1.9
+const toAudioGain = (sliderValue) => {
+  const x = Math.max(0, Math.min(1, Number(sliderValue) || 0))
+  return Math.pow(x, VOLUME_TAPER_POWER)
+}
+
 const DB_NAME = 'nova-player-db'
 const DB_VERSION = 1
 const STORE_NAME = 'tracks'
@@ -141,7 +150,7 @@ const UI_TEXT = {
     serverTracks: 'Sunucudakiler',
     publicPool: 'Müzik Havuzu',
     noPlaylistYet: 'Henüz playlist yok',
-    totalTracksReady: 'Toplam {count} şarkı hazır. Dosya veya bağlantı eklemek için Ekle butonunu kullan.',
+    totalTracksReady: '',
     noTracksYet: 'Henüz parça yok',
     noTracksHint: 'Dosya ya da link ekleyince burada temiz bir liste halinde görünecek.',
     noResults: 'Sonuç bulunamadı',
@@ -174,6 +183,9 @@ const UI_TEXT = {
     transparent: 'Şeffaf',
     options: 'Ayarlar',
     optionsHint: 'Kullanım seçeneklerini buradan açıp kapat.',
+    systemOptions: 'Sistem ayarları',
+    systemOptionsHint: 'Genel kullanım ve oynatma davranışlarını buradan yönet.',
+    preventSleepWhilePlaying: 'Şarkı çalarken ekranı açık tut ve uyku modunu engelle',
     monoAudio: 'Sesi mono olarak çal',
     spaceShortcut: 'Boşluk tuşu ile çal/duraklat',
     arrowShortcut: 'Ok tuşlarıyla 5 sn ileri/geri sar',
@@ -286,6 +298,9 @@ const UI_TEXT = {
     transparent: 'Transparent',
     options: 'Options',
     optionsHint: 'Toggle app behavior options.',
+    systemOptions: 'System settings',
+    systemOptionsHint: 'Manage general behavior and playback actions here.',
+    preventSleepWhilePlaying: 'Keep screen awake and block sleep while music is playing',
     monoAudio: 'Play audio in mono',
     spaceShortcut: 'Space to play/pause',
     arrowShortcut: 'Arrow keys seek 5 seconds',
@@ -785,6 +800,17 @@ const normalizeDriveUrl = (value = '') => {
   return url
 }
 
+const isLikelyDirectAudioUrl = (value = '') => {
+  const normalized = String(value || '').toLowerCase()
+  if (!normalized) {
+    return false
+  }
+  return (
+    normalized.includes('export=download') ||
+    /\.(mp3|wav|flac|m4a|aac|ogg)(\?|$)/i.test(normalized)
+  )
+}
+
 const getFileNameFromUrl = (value = '') => {
   const url = String(value || '').trim()
   if (!url) {
@@ -935,6 +961,37 @@ const isSingleOrEpAlbumName = (value = '') => {
   )
 }
 
+const isStrongAlbumNameMatch = (leftValue = '', rightValue = '') => {
+  const left = normalizeCoverMatchText(leftValue)
+  const right = normalizeCoverMatchText(rightValue)
+  if (!left || !right) {
+    return false
+  }
+  if (left === right) {
+    return true
+  }
+
+  const leftTokens = left.split(' ').filter((token) => token.length >= 3)
+  const rightTokens = right.split(' ').filter((token) => token.length >= 3)
+  const leftSet = new Set(leftTokens)
+  const sharedTokens = rightTokens.filter((token) => leftSet.has(token)).length
+
+  if (leftTokens.length && rightTokens.length) {
+    const ratio = sharedTokens / Math.max(leftTokens.length, rightTokens.length)
+    if (sharedTokens >= Math.min(2, rightTokens.length) && ratio >= 0.74) {
+      return true
+    }
+  }
+
+  const includesMatch = left.includes(right) || right.includes(left)
+  const lengthGap = Math.abs(left.length - right.length)
+  if (includesMatch && lengthGap <= 2 && Math.min(left.length, right.length) >= 5) {
+    return true
+  }
+
+  return false
+}
+
 const fetchRemoteTrackMeta = async (title, artist, options = {}) => {
   const cleanTitle = normalizeCoverMatchText(title)
   const cleanArtist = normalizeCoverMatchText(artist)
@@ -962,7 +1019,6 @@ const fetchRemoteTrackMeta = async (title, artist, options = {}) => {
       [
         [artist, title].filter(Boolean).join(' ').trim(),
         [title, artist].filter(Boolean).join(' ').trim(),
-        [artist, title, options?.preferredAlbum || ''].filter(Boolean).join(' ').trim(),
       ].filter(Boolean),
     ),
   )
@@ -1060,10 +1116,6 @@ const fetchRemoteTrackMeta = async (title, artist, options = {}) => {
     if (!isTitleStrictMatch(trackName) || !isArtistStrictMatch(artistName)) {
       return null
     }
-    if (cleanAlbum && !hasAlbumMatch) {
-      return null
-    }
-
     let score = 0
 
     if (trackName === cleanTitle) {
@@ -1086,12 +1138,8 @@ const fetchRemoteTrackMeta = async (title, artist, options = {}) => {
       score += 15
     }
 
-    if (cleanAlbum) {
-      if (hasAlbumMatch) {
-        score += 18
-      } else {
-        score -= 28
-      }
+    if (cleanAlbum && hasAlbumMatch) {
+      score += 8
     }
 
     if (preferredDuration > 0 && trackDuration > 0) {
@@ -1170,7 +1218,7 @@ const fetchRemoteTrackMeta = async (title, artist, options = {}) => {
     }
   }
 
-  const minimumConfidence = cleanAlbum ? 70 : 58
+  const minimumConfidence = 56
   if (best?.artworkUrl100 && bestConfidence >= minimumConfidence) {
     return {
       coverUrl: best.artworkUrl100.replace(/100x100bb\./, '300x300bb.'),
@@ -1256,6 +1304,107 @@ const fetchRemoteTrackMeta = async (title, artist, options = {}) => {
     }
   } catch {
     // ignore MusicBrainz fallback errors
+  }
+
+  // Gevşek fallback: katı eşleşme kaçarsa sanatçı odaklı iTunes aramasıyla
+  // en olası kapağı yine de döndür.
+  try {
+    const looseTerms = Array.from(
+      new Set(
+        [
+          [artist, title].filter(Boolean).join(' ').trim(),
+          [title, artist].filter(Boolean).join(' ').trim(),
+        ].filter(Boolean),
+      ),
+    )
+
+    const scoreLooseCandidate = (item) => {
+      const artistName = normalizeCoverMatchText(item?.artistName || '')
+      const trackName = normalizeCoverMatchText(item?.trackName || '')
+      const albumName = normalizeCoverMatchText(item?.collectionName || '')
+      if (!artistName) {
+        return -1
+      }
+
+      if (!isArtistStrictMatch(artistName) || !isTitleStrictMatch(trackName)) {
+        return -1
+      }
+
+      let score = 0
+      if (artistName === cleanArtist) {
+        score += 35
+      } else if (artistName.includes(cleanArtist) || cleanArtist.includes(artistName)) {
+        score += 25
+      } else {
+        const artistTokenHits = artistTokensByCandidate
+          .flat()
+          .filter((token) => token && artistName.includes(token)).length
+        score += Math.min(16, artistTokenHits * 4)
+      }
+
+      if (cleanTitle) {
+        if (trackName === cleanTitle) {
+          score += 20
+        } else if (trackName.includes(cleanTitle) || cleanTitle.includes(trackName)) {
+          score += 12
+        } else {
+          const titleHits = titleTokens.filter((token) => trackName.includes(token)).length
+          score += Math.min(10, titleHits * 3)
+        }
+      }
+
+      if (cleanAlbum) {
+        if (albumName === cleanAlbum) {
+          score += 20
+        } else if (albumName.includes(cleanAlbum) || cleanAlbum.includes(albumName)) {
+          score += 12
+        } else {
+          const albumHits = albumTokens.filter((token) => albumName.includes(token)).length
+          score += Math.min(10, albumHits * 3)
+        }
+      }
+
+      if (isSingleOrEpAlbumName(albumName)) {
+        score -= 6
+      }
+      return score
+    }
+
+    let looseBest = null
+    let looseBestScore = -1
+
+    for (const term of looseTerms) {
+      const response = await fetch(
+        `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=music&entity=song&limit=40`,
+      )
+      if (!response.ok) {
+        continue
+      }
+      const json = await response.json()
+      const rows = Array.isArray(json?.results) ? json.results : []
+      for (const row of rows) {
+        if (!row?.artworkUrl100) {
+          continue
+        }
+        const score = scoreLooseCandidate(row)
+        if (score > looseBestScore) {
+          looseBestScore = score
+          looseBest = row
+        }
+      }
+    }
+
+    if (looseBest?.artworkUrl100 && looseBestScore >= 62) {
+      return {
+        coverUrl: String(looseBest.artworkUrl100).replace(/100x100bb\./, '600x600bb.'),
+        album: String(looseBest.collectionName || '').trim(),
+        genre: normalizeGenreName(looseBest.primaryGenreName || ''),
+        confidence: Math.max(35, Math.min(78, looseBestScore)),
+        source: 'itunes-loose',
+      }
+    }
+  } catch {
+    // ignore loose fallback errors
   }
 
   return { coverUrl: '', album: '', genre: '' }
@@ -1431,10 +1580,11 @@ const fetchAlbumInsights = async ({ artist = '', album = '', title = '' }) => {
     if (cleanAlbum) {
       if (albumName === cleanAlbum) {
         score += 55
-      } else if (albumName.includes(cleanAlbum) || cleanAlbum.includes(albumName)) {
+      } else if (isStrongAlbumNameMatch(albumName, cleanAlbum)) {
         score += 36
       } else {
-        score -= 20
+        // Albüm adı verildiyse yanlış albüme hiç düşme.
+        continue
       }
     } else if (cleanTitle && (albumName.includes(cleanTitle) || cleanTitle.includes(albumName))) {
       score += 12
@@ -1458,11 +1608,48 @@ const fetchAlbumInsights = async ({ artist = '', album = '', title = '' }) => {
     return null
   }
 
+  if (cleanAlbum && !isStrongAlbumNameMatch(best.collectionName || '', cleanAlbum)) {
+    return null
+  }
+
   return {
     album: String(best.collectionName || album || '').trim(),
     artist: String(best.artistName || artist || '').trim(),
     releaseDate: String(best.releaseDate || '').trim(),
     coverUrl: best.artworkUrl100 ? best.artworkUrl100.replace(/100x100bb\./, '600x600bb.') : '',
+  }
+}
+
+const fillCoverFromAlbumInsight = async ({
+  title = '',
+  artist = '',
+  album = '',
+  coverUrl = '',
+}) => {
+  const currentCover = String(coverUrl || '').trim()
+  const currentAlbum = String(album || '').trim()
+  if (currentCover) {
+    return { coverUrl: currentCover, album: currentAlbum }
+  }
+
+  const cleanArtist = sanitizeDisplayText(artist || '').trim()
+  const cleanTitle = cleanFilenameTrackTitle(title || '').trim()
+  if (!cleanArtist || !cleanTitle) {
+    return { coverUrl: currentCover, album: currentAlbum }
+  }
+
+  try {
+    const fallbackMeta = await fetchRemoteTrackMeta(cleanTitle, cleanArtist, {
+      preferredAlbum: '',
+      preferredDuration: 0,
+    })
+
+    return {
+      coverUrl: String(fallbackMeta?.coverUrl || currentCover || '').trim(),
+      album: String(fallbackMeta?.album || currentAlbum || '').trim(),
+    }
+  } catch {
+    return { coverUrl: currentCover, album: currentAlbum }
   }
 }
 
@@ -2135,6 +2322,63 @@ const cleanTrackTitleForLyrics = (value = '') =>
 
 const normalizeLyricsText = (value = '') => String(value || '').replace(/\r\n/g, '\n').trim()
 
+const getLinkDraftSignature = (draft = {}) =>
+  [
+    String(draft?.audioUrl || '').trim(),
+    String(draft?.title || '').trim(),
+    String(draft?.artist || '').trim(),
+    String(draft?.coverUrl || '').trim(),
+  ]
+    .join('||')
+    .toLowerCase()
+
+const parseLrcTimestamp = (raw = '') => {
+  const token = String(raw || '').trim()
+  const match = token.match(/^(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?$/)
+  if (!match) {
+    return null
+  }
+  const minutes = Number(match[1] || 0)
+  const seconds = Number(match[2] || 0)
+  const fractionRaw = String(match[3] || '')
+  const fraction = fractionRaw
+    ? Number(`0.${fractionRaw.padEnd(3, '0').slice(0, 3)}`)
+    : 0
+  return minutes * 60 + seconds + fraction
+}
+
+const parseLyricsWithTiming = (text = '') => {
+  const normalized = normalizeLyricsText(text)
+  if (!normalized) {
+    return { hasTiming: false, lines: [] }
+  }
+  const rawLines = normalized.split('\n')
+  const timed = []
+  const plain = []
+  for (const rawLine of rawLines) {
+    const line = String(rawLine || '')
+    const matches = [...line.matchAll(/\[(\d{1,2}:\d{2}(?:[.,]\d{1,3})?)\]/g)]
+    const lyric = line.replace(/\[(\d{1,2}:\d{2}(?:[.,]\d{1,3})?)\]/g, '').trim()
+    if (matches.length) {
+      for (const item of matches) {
+        const at = parseLrcTimestamp(item[1])
+        if (at == null) continue
+        timed.push({ at, text: lyric || '...' })
+      }
+    } else {
+      plain.push(line)
+    }
+  }
+  if (!timed.length) {
+    return {
+      hasTiming: false,
+      lines: plain.map((line) => ({ at: null, text: line })),
+    }
+  }
+  timed.sort((a, b) => a.at - b.at)
+  return { hasTiming: true, lines: timed }
+}
+
 const fetchLyricsFromMakeItPersonal = async (artist, title) => {
   const response = await fetch(
     `https://makeitpersonal.co/lyrics?artist=${encodeURIComponent(artist)}&title=${encodeURIComponent(title)}`,
@@ -2167,6 +2411,59 @@ const fetchLyricsFromPopcat = async (artist, title) => {
   return text || ''
 }
 
+const extractLrcLibLyrics = (item) => {
+  if (!item) {
+    return ''
+  }
+  const synced = normalizeLyricsText(item?.syncedLyrics)
+  if (synced) {
+    return synced
+  }
+  return normalizeLyricsText(item?.plainLyrics)
+}
+
+const fetchLyricsFromLrcLib = async (artist, title) => {
+  try {
+    const response = await fetch(
+      `https://lrclib.net/api/get?artist_name=${encodeURIComponent(
+        artist,
+      )}&track_name=${encodeURIComponent(title)}`,
+    )
+    if (response.ok) {
+      const json = await response.json()
+      const text = extractLrcLibLyrics(json)
+      if (text) {
+        return text
+      }
+    }
+  } catch {
+    // try search endpoint
+  }
+
+  try {
+    const response = await fetch(
+      `https://lrclib.net/api/search?artist_name=${encodeURIComponent(
+        artist,
+      )}&track_name=${encodeURIComponent(title)}`,
+    )
+    if (response.ok) {
+      const json = await response.json()
+      if (Array.isArray(json) && json.length) {
+        for (const item of json) {
+          const text = extractLrcLibLyrics(item)
+          if (text) {
+            return text
+          }
+        }
+      }
+    }
+  } catch {
+    // no-op
+  }
+
+  return ''
+}
+
 const fetchLyricsForTrack = async (track) => {
   const titleVariants = Array.from(
     new Set([cleanTrackTitleForLyrics(track?.title || ''), track?.title || ''].filter(Boolean)),
@@ -2181,6 +2478,15 @@ const fetchLyricsForTrack = async (track) => {
   for (const artist of artistVariants) {
     for (const title of titleVariants) {
       try {
+        const lyricText = await fetchLyricsFromLrcLib(artist, title)
+        if (lyricText) {
+          return lyricText
+        }
+      } catch {
+        // try next source
+      }
+
+      try {
         const response = await fetch(
           `https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(title)}`,
         )
@@ -2192,43 +2498,6 @@ const fetchLyricsForTrack = async (track) => {
         const lyricText = normalizeLyricsText(json?.lyrics)
         if (lyricText) {
           return lyricText
-        }
-      } catch {
-        // try next source
-      }
-
-      try {
-        const response = await fetch(
-          `https://lrclib.net/api/get?artist_name=${encodeURIComponent(
-            artist,
-          )}&track_name=${encodeURIComponent(title)}`,
-        )
-        if (!response.ok) {
-          continue
-        }
-
-        const json = await response.json()
-        const lyricText = normalizeLyricsText(json?.plainLyrics || json?.syncedLyrics)
-        if (lyricText) {
-          return lyricText
-        }
-      } catch {
-        // try next source
-      }
-
-      try {
-        const response = await fetch(
-          `https://lrclib.net/api/search?artist_name=${encodeURIComponent(
-            artist,
-          )}&track_name=${encodeURIComponent(title)}`,
-        )
-        if (response.ok) {
-          const json = await response.json()
-          const item = Array.isArray(json) ? json[0] : null
-          const lyricText = normalizeLyricsText(item?.plainLyrics || item?.syncedLyrics)
-          if (lyricText) {
-            return lyricText
-          }
         }
       } catch {
         // try next source
@@ -2279,6 +2548,11 @@ const materializeTrack = (record, urlsRef) => {
 }
 
 const serializeTrack = (track) => {
+  const persistentAudioUrl = String(track?.audioUrl || '').trim()
+  const persistentCoverUrl = String(track?.coverUrl || '').trim()
+  const canPersistAudioUrl = persistentAudioUrl && !persistentAudioUrl.startsWith('blob:')
+  const canPersistCoverUrl = persistentCoverUrl && !persistentCoverUrl.startsWith('blob:')
+
   if (track?.source === 'link') {
     const { audioBlob: _audioBlob, coverBlob: _coverBlob, isFavorite: _isFavorite, ...rest } = track
     return {
@@ -2289,7 +2563,15 @@ const serializeTrack = (track) => {
   }
 
   const { audioUrl: _audioUrl, coverUrl: _coverUrl, isFavorite: _isFavorite, ...rest } = track
-  return rest
+  if (track?.audioBlob) {
+    return rest
+  }
+
+  return {
+    ...rest,
+    audioUrl: canPersistAudioUrl ? persistentAudioUrl : '',
+    coverUrl: canPersistCoverUrl ? persistentCoverUrl : '',
+  }
 }
 
 const applyFavoriteFlags = (tracks, favoriteIds = []) => {
@@ -2395,6 +2677,9 @@ function App() {
   const [hardwareAccelerationEnabled, setHardwareAccelerationEnabled] = useState(
     savedUi.hardwareAccelerationEnabled !== false,
   )
+  const [preventSleepWhilePlayingEnabled, setPreventSleepWhilePlayingEnabled] = useState(
+    savedUi.preventSleepWhilePlayingEnabled !== false,
+  )
   const [fullscreenEffectsEnabled, setFullscreenEffectsEnabled] = useState(
     savedUi.fullscreenEffectsEnabled !== false,
   )
@@ -2402,7 +2687,7 @@ function App() {
     Boolean(savedUi.reduceAnimationsEnabled),
   )
   const [lowPowerModeEnabled, setLowPowerModeEnabled] = useState(
-    Boolean(savedUi.lowPowerModeEnabled),
+    savedUi.lowPowerModeEnabled !== false,
   )
   const [compactListEnabled, setCompactListEnabled] = useState(
     Boolean(savedUi.compactListEnabled),
@@ -2416,6 +2701,9 @@ function App() {
   const [arrowSeekEnabled, setArrowSeekEnabled] = useState(savedUi.arrowSeekEnabled !== false)
   const [resetShortcutEnabled, setResetShortcutEnabled] = useState(
     savedUi.resetShortcutEnabled !== false,
+  )
+  const [resetShortcut, setResetShortcut] = useState(
+    typeof savedUi.resetShortcut === 'string' ? savedUi.resetShortcut : 'Ctrl+Shift+R',
   )
   const [mediaToggleShortcut, setMediaToggleShortcut] = useState(
     typeof savedUi.mediaToggleShortcut === 'string' ? savedUi.mediaToggleShortcut : '',
@@ -2432,6 +2720,7 @@ function App() {
   const [editDraft, setEditDraft] = useState(null)
   const [bulkEditOpen, setBulkEditOpen] = useState(false)
   const [bulkEditDrafts, setBulkEditDrafts] = useState([])
+  const [bulkEditInitialDrafts, setBulkEditInitialDrafts] = useState([])
   const [bulkEditSaving, setBulkEditSaving] = useState(false)
   const [bulkCoverMenuTrackId, setBulkCoverMenuTrackId] = useState(null)
   const [bulkCoverTargetTrackId, setBulkCoverTargetTrackId] = useState(null)
@@ -2443,6 +2732,12 @@ function App() {
   const [playlistDescriptionDraft, setPlaylistDescriptionDraft] = useState('')
   const [playlistColorDraft, setPlaylistColorDraft] = useState(playlistColors[0])
   const [playlistCoverDraft, setPlaylistCoverDraft] = useState('')
+  const [playlistTxtImporting, setPlaylistTxtImporting] = useState(false)
+  const [playlistTxtFileName, setPlaylistTxtFileName] = useState('')
+  const [playlistTxtImportedTrackIds, setPlaylistTxtImportedTrackIds] = useState([])
+  const [playlistTxtEntriesDraft, setPlaylistTxtEntriesDraft] = useState([])
+  const playlistTxtImportCancelRef = useRef(false)
+  const playlistTxtImportNoticeIdRef = useRef('')
   const [editingPlaylistId, setEditingPlaylistId] = useState(null)
   const [playlistEditDraft, setPlaylistEditDraft] = useState('')
   const [playlistEditDescriptionDraft, setPlaylistEditDescriptionDraft] = useState('')
@@ -2464,6 +2759,18 @@ function App() {
   const [notificationsOpen, setNotificationsOpen] = useState(false)
   const [notifications, setNotifications] = useState([])
   const [hasUnreadNotifications, setHasUnreadNotifications] = useState(false)
+  const [updaterUiState, setUpdaterUiState] = useState({
+    supported: false,
+    checking: false,
+    updateAvailable: false,
+    downloading: false,
+    downloaded: false,
+    progressPercent: 0,
+    latestVersion: '',
+    error: '',
+  })
+  const [updaterManualCheckUpToDate, setUpdaterManualCheckUpToDate] = useState(false)
+  const updaterManualCheckPendingRef = useRef(false)
   const [notificationsPanelPosition, setNotificationsPanelPosition] = useState({
     top: 80,
     left: 16,
@@ -2486,6 +2793,7 @@ function App() {
   const [rightPanelTab, setRightPanelTab] = useState('artist')
   const [artistProfileOpen, setArtistProfileOpen] = useState(false)
   const [artistProfileName, setArtistProfileName] = useState('')
+  const [artistProfileSelectedAlbumKey, setArtistProfileSelectedAlbumKey] = useState('')
   const [artistProfileFacts, setArtistProfileFacts] = useState(null)
   const [artistProfileFactsLoading, setArtistProfileFactsLoading] = useState(false)
   const [albumInfoOpen, setAlbumInfoOpen] = useState(false)
@@ -2523,6 +2831,7 @@ function App() {
   const [isHydrated, setIsHydrated] = useState(false)
   const [isDragActive, setIsDragActive] = useState(false)
   const [playlistAddOpen, setPlaylistAddOpen] = useState(false)
+  const [playlistAddSearchQuery, setPlaylistAddSearchQuery] = useState('')
   const [trackListLayoutVersion, setTrackListLayoutVersion] = useState(0)
   const [renderedTrackCount, setRenderedTrackCount] = useState(TRACK_RENDER_BATCH_INITIAL)
   const [appBackgrounded, setAppBackgrounded] = useState(() =>
@@ -2546,7 +2855,6 @@ function App() {
   const lastSavedPlaylistsRef = useRef('')
   const lastSavedFavoritesRef = useRef('')
   const lastPersistedTracksSignatureRef = useRef('')
-  const progressAnimFrameRef = useRef(null)
   const playbackSequenceRef = useRef(null)
   const playbackSequenceDragRef = useRef({
     active: false,
@@ -2568,6 +2876,17 @@ function App() {
     audioUrl: '',
     coverUrl: '',
   })
+  const [linkAddSuccessSignature, setLinkAddSuccessSignature] = useState('')
+  const [youtubeSearchQuery, setYoutubeSearchQuery] = useState('')
+  const [youtubeSearchLoading, setYoutubeSearchLoading] = useState(false)
+  const [youtubeSearchResults, setYoutubeSearchResults] = useState([])
+  const [youtubeSearchError, setYoutubeSearchError] = useState('')
+  const [topbarYoutubeQuery, setTopbarYoutubeQuery] = useState('')
+  const [topbarYoutubeLoading, setTopbarYoutubeLoading] = useState(false)
+  const [topbarYoutubeResults, setTopbarYoutubeResults] = useState([])
+  const [topbarYoutubeError, setTopbarYoutubeError] = useState('')
+  const [topbarYoutubeAddingId, setTopbarYoutubeAddingId] = useState('')
+  const [topbarYoutubeAddedIds, setTopbarYoutubeAddedIds] = useState(() => new Set())
   const [poolDraft, setPoolDraft] = useState({
     title: '',
     artist: '',
@@ -2588,6 +2907,13 @@ function App() {
   const [poolGithubPath, setPoolGithubPath] = useState(savedUi.poolGithubPath || 'tracks.json')
   const [poolGithubToken, setPoolGithubToken] = useState(savedUi.poolGithubToken || '')
   const [poolGithubSaving, setPoolGithubSaving] = useState(false)
+  const [reportIssueOpen, setReportIssueOpen] = useState(false)
+  const [reportIssueSubmitting, setReportIssueSubmitting] = useState(false)
+  const [reportIssueDraft, setReportIssueDraft] = useState({
+    title: '',
+    subject: '',
+    description: '',
+  })
   const textSet = UI_TEXT[language] || UI_TEXT.tr
   const t = useCallback(
     (key, fallback = '') => {
@@ -2614,7 +2940,13 @@ function App() {
   const [poolSelectedTrackIds, setPoolSelectedTrackIds] = useState([])
   const poolSelectionAnchorIdRef = useRef(null)
   const [poolRefreshing, setPoolRefreshing] = useState(false)
-  const [playbackCollectionId, setPlaybackCollectionId] = useState('all')
+  const [playbackCollectionId, setPlaybackCollectionId] = useState(() => {
+    const savedPlaybackCollectionId = String(savedUi.playbackCollectionId || '').trim()
+    if (savedPlaybackCollectionId === 'pool' || savedPlaybackCollectionId === 'server') {
+      return 'all'
+    }
+    return savedPlaybackCollectionId || savedUi.selectedCollectionId || 'all'
+  })
 
   const getScrollableScrollTopTargets = useCallback(() => {
     if (typeof document === 'undefined') {
@@ -2781,6 +3113,7 @@ function App() {
   }, [bulkCoverMenuTrackId])
   const persistStateRef = useRef({
     selectedCollectionId,
+    playbackCollectionId,
     currentTrackId,
     progress,
     volume,
@@ -2788,6 +3121,7 @@ function App() {
     equalizerGains,
   })
   const playlistCoverInputRef = useRef(null)
+  const playlistTxtInputRef = useRef(null)
   const playlistEditCoverInputRef = useRef(null)
   const bulkCoverInputRef = useRef(null)
   const dockFavoritePulseTimerRef = useRef(null)
@@ -2931,16 +3265,26 @@ function App() {
       '--text-muted': 'rgba(15, 23, 42, 0.56)',
     }
   }, [effectiveBackgroundColor1, themeMode])
+  const topbarTitleColor = useMemo(() => {
+    const primary = parseColorToRgb(effectiveBackgroundColor1) || parseColorToRgb(currentThemeColor)
+    if (!primary) {
+      return themeMode === 'light' ? '#0f172a' : '#ffffff'
+    }
+    const brightness = (primary.r * 299 + primary.g * 587 + primary.b * 114) / 1000
+    return brightness >= 176 ? '#0f172a' : '#ffffff'
+  }, [currentThemeColor, effectiveBackgroundColor1, themeMode])
   const themeVars = {
     ...getUiThemeVars(themeMode),
     ...(brightGradientReadabilityVars || {}),
     '--app-bg': effectiveAppBackground,
     '--theme-accent': hexToRgba(currentThemeColor, 0.24),
     '--theme-accent-soft': hexToRgba(currentThemeColor, 0.08),
+    '--topbar-title-color': topbarTitleColor,
   }
   const runtimeLowPowerEnabled = lowPowerModeEnabled || reduceAnimationsEnabled || appBackgrounded
   const appShellClassName = `app-shell theme-${themeMode} ${brightGradientReadabilityVars ? 'bright-gradient' : ''} ${reduceAnimationsEnabled ? 'motion-reduced' : ''} ${runtimeLowPowerEnabled ? 'low-power' : ''} ${compactListEnabled ? 'compact-list' : ''} ${showScrollbars ? 'scrollbars-visible' : ''}`.trim()
   const sidebarPlayerActive = sidebarPlayerExpanded && windowCanUseSidebarPlayer
+  const lyricsViewActive = lyricsOpen || (sidebarPlayerActive && rightPanelTab === 'lyrics')
   const bottomDockVisible =
     dockPointerInside || dockProximityVisible || dockPlaylistMenuOpen || queueOpen || lyricsOpen
   const appShellLayoutClass = `${appShellClassName} ${sidebarPlayerActive ? 'sidebar-player-expanded' : 'sidebar-player-collapsed'}`
@@ -2972,6 +3316,24 @@ function App() {
   const currentTrackPresenceTitle = currentTrack?.title || ''
   const currentTrackPresenceArtist = currentTrack?.artist || ''
   const currentTrackDisplayTitle = sanitizeDisplayText(currentTrack?.title || '') || 'Bir parça seç'
+  const parsedLyrics = useMemo(() => parseLyricsWithTiming(lyricsText), [lyricsText])
+  const activeLyricIndex = useMemo(() => {
+    if (!lyricsViewActive) {
+      return -1
+    }
+    if (!parsedLyrics.hasTiming || !parsedLyrics.lines.length) {
+      return -1
+    }
+    let activeIndex = -1
+    for (let index = 0; index < parsedLyrics.lines.length; index += 1) {
+      if (progress >= Number(parsedLyrics.lines[index]?.at || 0)) {
+        activeIndex = index
+      } else {
+        break
+      }
+    }
+    return activeIndex
+  }, [lyricsViewActive, parsedLyrics, progress])
   const artistProfileLibraryTracks = useMemo(
     () => sortTracksByOrder(tracks.filter((track) => doesArtistMatch(track.artist || '', artistProfileName))),
     [artistProfileName, tracks],
@@ -3005,6 +3367,19 @@ function App() {
 
     return Array.from(groups.values()).sort((a, b) => a.album.localeCompare(b.album, 'tr-TR'))
   }, [artistProfileTracks])
+  const artistProfileSelectedAlbum = useMemo(
+    () => artistProfileAlbums.find((album) => album.key === artistProfileSelectedAlbumKey) || null,
+    [artistProfileAlbums, artistProfileSelectedAlbumKey],
+  )
+  const artistProfileSelectedAlbumTracks = useMemo(() => {
+    if (!artistProfileSelectedAlbum) return []
+    return sortTracksByOrder(
+      artistProfileTracks.filter(
+        (track) =>
+          (String(track.album || '').trim() || 'Single').toLocaleLowerCase('tr-TR') === artistProfileSelectedAlbum.key,
+      ),
+    )
+  }, [artistProfileSelectedAlbum, artistProfileTracks])
   const artistProfilePhotoUrl =
     String(artistProfileFacts?.photoUrl || '').trim() ||
     getTrackDisplayUrl(artistProfileLibraryTracks[0], 'cover') ||
@@ -3358,6 +3733,19 @@ function App() {
   ])
 
   const renderedTracks = useMemo(() => displayedTracks, [displayedTracks])
+  const playlistAddFilteredTracks = useMemo(() => {
+    const query = String(playlistAddSearchQuery || '').trim().toLocaleLowerCase('tr-TR')
+    const base = sortTracksByOrder(tracks)
+    if (!query) {
+      return base
+    }
+    return base.filter((track) => {
+      const title = String(track?.title || '').toLocaleLowerCase('tr-TR')
+      const artist = String(track?.artist || '').toLocaleLowerCase('tr-TR')
+      const album = String(track?.album || '').toLocaleLowerCase('tr-TR')
+      return title.includes(query) || artist.includes(query) || album.includes(query)
+    })
+  }, [playlistAddSearchQuery, tracks])
   const hasMoreRenderedTracks = false
 
   const getLocalLibraryMatchKey = useCallback((track) => {
@@ -3753,7 +4141,10 @@ function App() {
 
   const handlePlaybackSequencePointerEnd = (event) => {
     const dragState = playbackSequenceDragRef.current
-    if (!dragState.active || dragState.pointerId !== event.pointerId) {
+    if (!dragState.active) {
+      return
+    }
+    if (dragState.pointerId !== event.pointerId) {
       return
     }
 
@@ -3764,6 +4155,27 @@ function App() {
       dragState.moved = false
     }, 0)
   }
+
+  useEffect(() => {
+    const forceStopDrag = () => {
+      const dragState = playbackSequenceDragRef.current
+      if (!dragState.active) {
+        return
+      }
+      dragState.active = false
+      dragState.pointerId = null
+      dragState.moved = false
+    }
+
+    window.addEventListener('pointerup', forceStopDrag)
+    window.addEventListener('pointercancel', forceStopDrag)
+    window.addEventListener('blur', forceStopDrag)
+    return () => {
+      window.removeEventListener('pointerup', forceStopDrag)
+      window.removeEventListener('pointercancel', forceStopDrag)
+      window.removeEventListener('blur', forceStopDrag)
+    }
+  }, [])
 
   const updateTrack = (trackId, updates) => {
     setTracks((prev) =>
@@ -3811,6 +4223,7 @@ function App() {
     setBulkCoverMenuTrackId(null)
     setBulkCoverTargetTrackId(null)
     setBulkEditDrafts(drafts)
+    setBulkEditInitialDrafts(drafts)
     setBulkEditOpen(true)
   }
 
@@ -3820,6 +4233,7 @@ function App() {
     }
     setBulkEditOpen(false)
     setBulkEditDrafts([])
+    setBulkEditInitialDrafts([])
     setBulkCoverMenuTrackId(null)
     setBulkCoverTargetTrackId(null)
   }
@@ -3828,6 +4242,24 @@ function App() {
     setBulkEditDrafts((prev) =>
       prev.map((item) => (item.id === trackId ? { ...item, [field]: value } : item)),
     )
+  }
+
+  const undoBulkEdits = () => {
+    if (bulkEditSaving) {
+      return
+    }
+    setBulkEditDrafts(bulkEditInitialDrafts.map((item) => ({ ...item })))
+    setBulkCoverMenuTrackId(null)
+    setBulkCoverTargetTrackId(null)
+  }
+
+  const removeBulkDraft = (trackId) => {
+    if (!trackId) {
+      return
+    }
+    setBulkEditDrafts((prev) => prev.filter((item) => item.id !== trackId))
+    setBulkCoverMenuTrackId((prev) => (prev === trackId ? null : prev))
+    setBulkCoverTargetTrackId((prev) => (prev === trackId ? null : prev))
   }
 
   const openBulkCoverPicker = (trackId) => {
@@ -3896,6 +4328,10 @@ function App() {
     setPlaylistDescriptionDraft('')
     setPlaylistColorDraft(playlistColors[playlists.length % playlistColors.length])
     setPlaylistCoverDraft('')
+    setPlaylistTxtImporting(false)
+    setPlaylistTxtFileName('')
+    setPlaylistTxtImportedTrackIds([])
+    setPlaylistTxtEntriesDraft([])
     setCreatingPlaylist(true)
   }
 
@@ -3904,17 +4340,23 @@ function App() {
     setPlaylistNameDraft('')
     setPlaylistDescriptionDraft('')
     setPlaylistCoverDraft('')
+    setPlaylistTxtImporting(false)
+    setPlaylistTxtFileName('')
+    setPlaylistTxtImportedTrackIds([])
+    setPlaylistTxtEntriesDraft([])
   }
 
   const openPlaylistAddModal = () => {
     if (!currentPlaylist) {
       return
     }
+    setPlaylistAddSearchQuery('')
     setPlaylistAddOpen(true)
   }
 
   const closePlaylistAddModal = () => {
     setPlaylistAddOpen(false)
+    setPlaylistAddSearchQuery('')
   }
 
   const openPlaylistEditor = (playlist) => {
@@ -3947,6 +4389,8 @@ function App() {
     setLyricsOpen(false)
     setQueueOpen(false)
     setPlaylistAddOpen(false)
+    setTopbarYoutubeResults([])
+    setTopbarYoutubeError('')
   }
 
   const openPlaylistContextMenu = (playlistId, pointer) => {
@@ -4105,6 +4549,7 @@ function App() {
   const closeFullscreenTrack = useCallback(() => {
     setFullscreenTrackOpen(false)
     setFullscreenQueueOpen(false)
+    setLyricsOpen(false)
     setAppFullscreen(false)
     hideFullscreenControls()
   }, [hideFullscreenControls, setAppFullscreen])
@@ -4250,6 +4695,7 @@ function App() {
     }
     setNotifications((prev) => [nextNotice, ...prev].slice(0, 120))
     setHasUnreadNotifications(true)
+    return nextNotice.id
   }
 
   const upsertDownloadJob = useCallback((payload = {}) => {
@@ -4411,12 +4857,38 @@ function App() {
     }
 
     const handleUpdaterEvent = (payload) => {
+      setUpdaterUiState((prev) => ({
+        ...prev,
+        supported: prev.supported || Boolean(payload?.supported),
+        checking: Boolean(payload?.checking),
+        updateAvailable: Boolean(payload?.updateAvailable),
+        downloading: Boolean(payload?.downloading),
+        downloaded: Boolean(payload?.downloaded),
+        progressPercent: Number(payload?.progressPercent || 0),
+        latestVersion: String(payload?.latestVersion || ''),
+        error: String(payload?.error || ''),
+      }))
+
       const eventName = String(payload?.event || '').trim()
       if (!eventName) {
         return
       }
 
+      if (eventName === 'manual-check' || eventName === 'checking') {
+        setUpdaterManualCheckUpToDate(false)
+      }
+
+      if (eventName === 'not-available') {
+        if (updaterManualCheckPendingRef.current) {
+          setUpdaterManualCheckUpToDate(true)
+          updaterManualCheckPendingRef.current = false
+        }
+        return
+      }
+
       if (eventName === 'available') {
+        updaterManualCheckPendingRef.current = false
+        setUpdaterManualCheckUpToDate(false)
         const version = String(payload?.latestVersion || '').trim()
         notifyOnce(
           `available:${version || 'unknown'}`,
@@ -4426,6 +4898,7 @@ function App() {
       }
 
       if (eventName === 'downloaded') {
+        updaterManualCheckPendingRef.current = false
         const version = String(payload?.latestVersion || '').trim()
         notifyOnce(
           `downloaded:${version || 'unknown'}`,
@@ -4437,6 +4910,8 @@ function App() {
       }
 
       if (eventName === 'error') {
+        updaterManualCheckPendingRef.current = false
+        setUpdaterManualCheckUpToDate(false)
         const errorText = String(payload?.error || '').trim()
         if (!errorText) {
           return
@@ -4447,6 +4922,16 @@ function App() {
 
     const unsubscribe = bridge.onUpdaterEvent(handleUpdaterEvent)
     bridge.getUpdaterState?.().then((state) => {
+      setUpdaterUiState({
+        supported: Boolean(state?.supported),
+        checking: Boolean(state?.checking),
+        updateAvailable: Boolean(state?.updateAvailable),
+        downloading: Boolean(state?.downloading),
+        downloaded: Boolean(state?.downloaded),
+        progressPercent: Number(state?.progressPercent || 0),
+        latestVersion: String(state?.latestVersion || ''),
+        error: String(state?.error || ''),
+      })
       if (state?.downloaded) {
         const version = String(state?.latestVersion || '').trim()
         notifyOnce(
@@ -4478,6 +4963,122 @@ function App() {
       }
       return filtered
     })
+  }
+
+  const handleUpdaterCheckNow = async () => {
+    try {
+      updaterManualCheckPendingRef.current = true
+      setUpdaterManualCheckUpToDate(false)
+      const result = await window.novaPlayer?.checkForUpdates?.()
+      if (result?.ok === false && result?.reason) {
+        updaterManualCheckPendingRef.current = false
+        setUpdaterManualCheckUpToDate(false)
+        showUploadNotice(`Güncelleme kontrolü: ${result.reason}`)
+      }
+    } catch {
+      updaterManualCheckPendingRef.current = false
+      setUpdaterManualCheckUpToDate(false)
+      showUploadNotice('Güncelleme kontrolü başlatılamadı.')
+    }
+  }
+
+  const handleUpdaterInstallNow = async () => {
+    try {
+      const result = await window.novaPlayer?.installUpdate?.()
+      if (!result?.ok) {
+        showUploadNotice('Kurulum henüz hazır değil.')
+        return
+      }
+      showUploadNotice('Güncelleme kuruluyor, uygulama kapanıp yeniden açılacak.')
+    } catch {
+      showUploadNotice('Güncelleme kurulumu başlatılamadı.')
+    }
+  }
+
+  const openReportIssueModal = () => {
+    setReportIssueDraft({
+      title: '',
+      subject: '',
+      description: '',
+    })
+    setReportIssueSubmitting(false)
+    setReportIssueOpen(true)
+  }
+
+  const submitReportIssue = async () => {
+    const title = String(reportIssueDraft.title || '').trim()
+    const subject = String(reportIssueDraft.subject || '').trim()
+    const description = String(reportIssueDraft.description || '').trim()
+
+    if (!title || !subject || !description) {
+      showUploadNotice('Başlık, konu ve açıklama zorunlu.')
+      return
+    }
+
+    setReportIssueSubmitting(true)
+
+    const context = {
+      appName: APP_NAME,
+      appVersion: APP_VERSION,
+      platform: window?.novaPlayer?.platform || navigator?.platform || 'unknown',
+      currentTrackId,
+      selectedCollectionId,
+      playbackCollectionId,
+      themeMode,
+      isPlaying,
+      volume,
+      progress: Number(progress || 0),
+      duration: Number(duration || 0),
+      timestamp: Date.now(),
+    }
+
+    try {
+      // Webhook-only mod: önce Electron bridge üzerinden doğrudan gönder.
+      if (window.novaPlayer?.reportIssue) {
+        const bridgeResult = await window.novaPlayer.reportIssue({
+          title,
+          subject,
+          description,
+          context,
+        })
+        if (bridgeResult?.ok) {
+          showUploadNotice('Hata bildirimi Discord kanalına gönderildi.')
+          setReportIssueOpen(false)
+          setReportIssueSubmitting(false)
+          return
+        }
+      }
+
+      // Bridge yoksa / başarısızsa API relay dene.
+      const response = await fetch(`${API_BASE}/api/report-issue`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          title,
+          subject,
+          description,
+          context,
+        }),
+      })
+
+      if (response.ok) {
+        showUploadNotice('Hata bildirimi Discord kanalına gönderildi.')
+        setReportIssueOpen(false)
+        setReportIssueSubmitting(false)
+        return
+      }
+
+      const apiDetail = await response.json().catch(() => ({}))
+      const reason = String(apiDetail?.error || `api_http_${response.status}`)
+
+      showUploadNotice(`Hata bildirimi gönderilemedi: ${reason}`)
+      setReportIssueSubmitting(false)
+    } catch {
+      showUploadNotice('Hata bildirimi gönderilemedi: sunucuya bağlanılamadı.')
+      setReportIssueSubmitting(false)
+    }
   }
 
   const clearDownloadJobs = () => {
@@ -4675,29 +5276,49 @@ function App() {
   const openAddModal = () => {
     setAddMode('choose')
     setAddModalOpen(true)
+    setLinkAddSuccessSignature('')
     setLinkDraft({
       title: '',
       artist: '',
       audioUrl: '',
       coverUrl: '',
     })
+    setYoutubeSearchQuery('')
+    setYoutubeSearchResults([])
+    setYoutubeSearchError('')
+    setYoutubeSearchLoading(false)
   }
 
   const closeAddModal = () => {
     setAddModalOpen(false)
     setAddMode('choose')
+    setLinkAddSuccessSignature('')
     setLinkDraft({
       title: '',
       artist: '',
       audioUrl: '',
       coverUrl: '',
     })
+    setYoutubeSearchQuery('')
+    setYoutubeSearchResults([])
+    setYoutubeSearchError('')
+    setYoutubeSearchLoading(false)
   }
 
   const searchYouTube = (track) => {
     const query = encodeURIComponent(`${track.title} ${track.artist}`)
     window.novaPlayer?.openExternal?.(`https://www.youtube.com/results?search_query=${query}`)
   }
+
+  useEffect(() => {
+    if (!addModalOpen || addMode !== 'link') {
+      return
+    }
+    const nextSignature = getLinkDraftSignature(linkDraft)
+    if (linkAddSuccessSignature && nextSignature !== linkAddSuccessSignature) {
+      setLinkAddSuccessSignature('')
+    }
+  }, [addModalOpen, addMode, linkDraft, linkAddSuccessSignature])
 
   const releaseTrackResources = (track) => {
     if (track.audioUrl?.startsWith('blob:')) {
@@ -4716,7 +5337,7 @@ function App() {
   useEffect(() => {
     const audio = audioRef.current
     if (audio) {
-      audio.volume = volume
+      audio.volume = toAudioGain(volume)
     }
   }, [volume])
 
@@ -4958,24 +5579,66 @@ function App() {
   useEffect(() => {
     persistStateRef.current = {
       selectedCollectionId,
+      playbackCollectionId,
       currentTrackId,
       progress,
       volume,
       isPlaying,
       equalizerGains,
     }
-  }, [currentTrackId, isPlaying, progress, selectedCollectionId, volume, equalizerGains])
+  }, [currentTrackId, isPlaying, playbackCollectionId, progress, selectedCollectionId, volume, equalizerGains])
 
   useEffect(() => {
     let cancelled = false
 
     const hydrate = async () => {
         try {
-          const [storedTracks, prefs, storedPlaylists] = await Promise.all([
+          const [storedTracksRaw, prefs, storedPlaylists] = await Promise.all([
             getStoredTracks(),
             Promise.resolve(loadUiPrefs()),
             Promise.resolve(loadJson(PLAYLISTS_KEY, [])),
         ])
+        let storedTracks = Array.isArray(storedTracksRaw) ? storedTracksRaw : []
+        if (window.novaPlayer?.resolveLocalTrackUrls) {
+          const missingLocalUrlTracks = storedTracks
+            .filter((record) =>
+              String(record?.source || '') === 'local' &&
+              !record?.audioBlob &&
+              !String(record?.audioUrl || '').trim() &&
+              String(record?.fileName || '').trim(),
+            )
+            .map((record) => ({
+              id: record.id,
+              fileName: String(record.fileName || '').trim(),
+              audioUrl: String(record.audioUrl || '').trim(),
+            }))
+
+          if (missingLocalUrlTracks.length) {
+            try {
+              const repaired = await window.novaPlayer.resolveLocalTrackUrls({
+                tracks: missingLocalUrlTracks,
+              })
+              const resolvedMap =
+                repaired?.ok && repaired?.resolved && typeof repaired.resolved === 'object'
+                  ? repaired.resolved
+                  : {}
+              if (Object.keys(resolvedMap).length) {
+                storedTracks = storedTracks.map((record) => {
+                  const resolvedAudioUrl = String(resolvedMap[record?.id] || '').trim()
+                  if (!resolvedAudioUrl) {
+                    return record
+                  }
+                  return {
+                    ...record,
+                    audioUrl: resolvedAudioUrl,
+                  }
+                })
+              }
+            } catch {
+              // keep existing records if resolver fails
+            }
+          }
+        }
         if (cancelled) {
           return
         }
@@ -4998,6 +5661,11 @@ function App() {
           })),
         )
         setSelectedCollectionId(prefs.selectedCollectionId || 'all')
+        setPlaybackCollectionId(
+          prefs.playbackCollectionId === 'pool' || prefs.playbackCollectionId === 'server'
+            ? 'all'
+            : prefs.playbackCollectionId || prefs.selectedCollectionId || 'all',
+        )
         setLanguage(UI_LANGUAGES.includes(prefs.language) ? prefs.language : 'tr')
         setSharedManifestUrl(prefs.sharedManifestUrl || DEFAULT_SHARED_MANIFEST_URL)
         setPoolGithubOwner(String(prefs.poolGithubOwner || '').trim())
@@ -5016,9 +5684,10 @@ function App() {
         setBackgroundColor2(normalizeHexColor(prefs.backgroundColor2, defaultPalette.color2))
         setCloseBehavior(prefs.closeBehavior || 'tray')
         setHardwareAccelerationEnabled(prefs.hardwareAccelerationEnabled !== false)
+        setPreventSleepWhilePlayingEnabled(prefs.preventSleepWhilePlayingEnabled !== false)
         setFullscreenEffectsEnabled(prefs.fullscreenEffectsEnabled !== false)
         setReduceAnimationsEnabled(Boolean(prefs.reduceAnimationsEnabled))
-        setLowPowerModeEnabled(Boolean(prefs.lowPowerModeEnabled))
+        setLowPowerModeEnabled(prefs.lowPowerModeEnabled !== false)
         setCompactListEnabled(Boolean(prefs.compactListEnabled))
         setShowScrollbars(Boolean(prefs.showScrollbars))
         setSpaceKeyPlaybackEnabled(prefs.spaceKeyPlaybackEnabled !== false)
@@ -5063,6 +5732,7 @@ function App() {
   const baseUiPrefs = useMemo(
     () => ({
       selectedCollectionId,
+      playbackCollectionId,
       language,
       sharedManifestUrl,
       poolGithubOwner,
@@ -5098,6 +5768,7 @@ function App() {
     }),
     [
       selectedCollectionId,
+      playbackCollectionId,
       language,
       sharedManifestUrl,
       poolGithubOwner,
@@ -5126,6 +5797,7 @@ function App() {
       spaceKeyPlaybackEnabled,
       arrowSeekEnabled,
       resetShortcutEnabled,
+      resetShortcut,
       mediaToggleShortcut,
       sidebarPlayerExpanded,
       shuffleEnabled,
@@ -5210,6 +5882,7 @@ function App() {
       const snapshot = persistStateRef.current
       const nextPrefs = {
         selectedCollectionId: snapshot.selectedCollectionId,
+        playbackCollectionId: snapshot.playbackCollectionId,
         language,
         sharedManifestUrl,
         poolGithubOwner,
@@ -5436,11 +6109,6 @@ function App() {
   ])
 
   useEffect(() => {
-    if (progressAnimFrameRef.current) {
-      window.cancelAnimationFrame(progressAnimFrameRef.current)
-      progressAnimFrameRef.current = null
-    }
-
     if (!isPlaying || !currentTrackId) {
       return undefined
     }
@@ -5450,33 +6118,22 @@ function App() {
       return undefined
     }
 
-    let lastPaintAt = 0
-    const tick = (now) => {
+    // requestAnimationFrame yerine interval kullanarak CPU yükünü düşür.
+    const paintInterval = appBackgrounded
+      ? 900
+      : (runtimeLowPowerEnabled ? 180 : 90)
+
+    const timerId = window.setInterval(() => {
       if (audio.paused || audio.ended || currentTrackId !== persistStateRef.current.currentTrackId) {
-        progressAnimFrameRef.current = null
         return
       }
+      setProgress(audio.currentTime || 0)
+    }, paintInterval)
 
-      const paintInterval = document.hidden
-        ? 780
-        : (runtimeLowPowerEnabled ? 110 : 66)
-
-      if (now - lastPaintAt >= paintInterval) {
-        setProgress(audio.currentTime || 0)
-        lastPaintAt = now
-      }
-
-      progressAnimFrameRef.current = window.requestAnimationFrame(tick)
-    }
-
-    progressAnimFrameRef.current = window.requestAnimationFrame(tick)
     return () => {
-      if (progressAnimFrameRef.current) {
-        window.cancelAnimationFrame(progressAnimFrameRef.current)
-        progressAnimFrameRef.current = null
-      }
+      window.clearInterval(timerId)
     }
-  }, [currentTrackId, isPlaying, runtimeLowPowerEnabled])
+  }, [appBackgrounded, currentTrackId, isPlaying, runtimeLowPowerEnabled])
 
   useEffect(() => {
     const audio = audioRef.current
@@ -5507,17 +6164,17 @@ function App() {
 
     if (isPlaying) {
       const shouldFadeIn = Date.now() < trackSwitchFadeUntilRef.current
+      const targetGain = toAudioGain(volume)
       if (shouldFadeIn) {
-        const startVolume = Math.max(0, Math.min(1, volume * 0.2))
-        audio.volume = startVolume
+        audio.volume = Math.max(0, Math.min(1, targetGain * 0.2))
       } else {
-        audio.volume = volume
+        audio.volume = targetGain
       }
       audio.play().then(() => {
         if (shouldFadeIn) {
           window.setTimeout(() => {
             if (audioRef.current === audio) {
-              audio.volume = volume
+              audio.volume = targetGain
             }
           }, TRACK_SWITCH_FADE_MS)
         }
@@ -5550,6 +6207,9 @@ function App() {
         artist: currentTrackPresenceArtist,
         duration: duration,
         collection: activeCollectionLabel,
+        album: currentTrack?.album || '',
+        coverUrl: getTrackCoverUrl(currentTrack),
+        audioUrl: currentTrack?.audioUrl || '',
       },
       isPlaying,
       progress,
@@ -5557,7 +6217,7 @@ function App() {
     })
 
     return undefined
-  }, [currentTrackPresenceId, currentTrackPresenceTitle, currentTrackPresenceArtist, isPlaying, progressBucket, duration, progress, activeCollectionLabel])
+  }, [currentTrackPresenceId, currentTrackPresenceTitle, currentTrackPresenceArtist, isPlaying, progressBucket, duration, progress, activeCollectionLabel, currentTrack])
 
   const refreshPoolTracksNow = useCallback(async ({ silent = false } = {}) => {
     const remoteSources = [
@@ -5788,6 +6448,20 @@ function App() {
               if (resolvedAlbum) {
                 nextAlbum = resolvedAlbum
               }
+              if (!nextCover && nextArtist) {
+                const insightFallback = await fillCoverFromAlbumInsight({
+                  title: nextTitle,
+                  artist: nextArtist,
+                  album: nextAlbum,
+                  coverUrl: nextCover,
+                })
+                if (insightFallback.coverUrl) {
+                  nextCover = insightFallback.coverUrl
+                }
+                if ((!nextAlbum || nextAlbum.toLowerCase() === 'single') && insightFallback.album) {
+                  nextAlbum = insightFallback.album
+                }
+              }
               setLruCacheValue(coverArtCacheRef.current, cacheKey, nextCover || '', MAX_COVER_CACHE_ENTRIES)
               setLruCacheValue(albumCacheRef.current, cacheKey, nextAlbum || '', MAX_ALBUM_CACHE_ENTRIES)
             } catch {
@@ -6015,6 +6689,46 @@ function App() {
   }, [currentTrack, lyricsOpen, sidebarPlayerActive])
 
   useEffect(() => {
+    if (activeLyricIndex < 0 || !parsedLyrics.hasTiming) {
+      return
+    }
+    const alignActiveLine = () => {
+      if (typeof document === 'undefined') {
+        return
+      }
+      const containers = [
+        ...document.querySelectorAll('.lyrics-panel-body'),
+        ...document.querySelectorAll('.player-lyrics-text'),
+      ]
+      containers.forEach((container) => {
+        if (!(container instanceof HTMLElement)) {
+          return
+        }
+        if (!container.getClientRects().length) {
+          return
+        }
+        if (container.scrollHeight <= container.clientHeight + 4) {
+          return
+        }
+        const activeNode = container.querySelector('.lyrics-line.is-active')
+        if (!(activeNode instanceof HTMLElement)) {
+          return
+        }
+        const containerRect = container.getBoundingClientRect()
+        const activeRect = activeNode.getBoundingClientRect()
+        const activeCenter =
+          (activeRect.top - containerRect.top) + container.scrollTop + activeRect.height / 2
+        const targetTop = activeCenter - container.clientHeight / 2
+        const maxTop = Math.max(0, container.scrollHeight - container.clientHeight)
+        const nextTop = Math.max(0, Math.min(maxTop, targetTop))
+        container.scrollTop = nextTop
+      })
+    }
+    const frame = window.requestAnimationFrame(alignActiveLine)
+    return () => window.cancelAnimationFrame(frame)
+  }, [activeLyricIndex, parsedLyrics.hasTiming, lyricsViewActive])
+
+  useEffect(() => {
     if (selectedCollectionId === 'server') {
       setSelectedCollectionId('all')
       return
@@ -6082,6 +6796,7 @@ function App() {
       backgroundColor1,
       backgroundColor2,
       hardwareAccelerationEnabled,
+      preventSleepWhilePlayingEnabled,
       fullscreenEffectsEnabled,
       lowPowerModeEnabled,
       compactListEnabled,
@@ -6091,14 +6806,16 @@ function App() {
       themeMode,
       closeBehavior,
       hardwareAccelerationEnabled,
+      preventSleepWhilePlayingEnabled,
       resetShortcutEnabled,
+      resetShortcut,
       mediaToggleShortcut,
       reduceAnimationsEnabled,
       lowPowerModeEnabled,
       compactListEnabled,
       showScrollbars,
     })
-  }, [arrowSeekEnabled, backgroundColor1, backgroundColor2, backgroundStyle, closeBehavior, compactListEnabled, coverBasedBackgroundEnabled, fullscreenEffectsEnabled, hardwareAccelerationEnabled, language, lowPowerModeEnabled, mediaToggleShortcut, monoAudioEnabled, reduceAnimationsEnabled, resetShortcutEnabled, sharedManifestUrl, showScrollbars, spaceKeyPlaybackEnabled, themeMode])
+  }, [arrowSeekEnabled, backgroundColor1, backgroundColor2, backgroundStyle, closeBehavior, compactListEnabled, coverBasedBackgroundEnabled, fullscreenEffectsEnabled, hardwareAccelerationEnabled, language, lowPowerModeEnabled, mediaToggleShortcut, monoAudioEnabled, preventSleepWhilePlayingEnabled, reduceAnimationsEnabled, resetShortcutEnabled, resetShortcut, sharedManifestUrl, showScrollbars, spaceKeyPlaybackEnabled, themeMode])
 
   useEffect(() => {
     if (!isHydrated || appBackgrounded) {
@@ -6400,6 +7117,19 @@ function App() {
             // ignore fallback lookup errors
           }
         }
+        if (!remoteMeta?.coverUrl) {
+          const insightFallback = await fillCoverFromAlbumInsight({
+            title,
+            artist,
+            album: String(remoteMeta?.album || album || inferredIdentity?.album || '').trim(),
+            coverUrl: String(remoteMeta?.coverUrl || inferredIdentity?.coverUrl || '').trim(),
+          })
+          remoteMeta = {
+            ...remoteMeta,
+            coverUrl: String(insightFallback.coverUrl || remoteMeta?.coverUrl || '').trim(),
+            album: String(insightFallback.album || remoteMeta?.album || '').trim(),
+          }
+        }
         remoteCoverUrl = remoteMeta?.coverUrl || inferredIdentity?.coverUrl || ''
         resolvedGenre = normalizeGenreName(remoteMeta?.genre || resolvedGenre)
         if (!album && remoteMeta?.album) {
@@ -6482,83 +7212,380 @@ function App() {
     event.target.value = ''
   }
 
-  const handleLinkAdd = async () => {
-    const title = cleanFilenameTrackTitle(linkDraft.title) || ''
-    const artist = linkDraft.artist.trim()
-    const audioUrl = normalizeDriveUrl(linkDraft.audioUrl)
+  const handleYouTubeSearch = async () => {
+    const query = String(youtubeSearchQuery || '').trim()
+    if (!query) {
+      setYoutubeSearchError('Önce arama yaz.')
+      setYoutubeSearchResults([])
+      return
+    }
+
+    if (!window.novaPlayer?.searchYoutube) {
+      setYoutubeSearchError('Bu sürümde YouTube arama desteği yok.')
+      return
+    }
+
+    setYoutubeSearchLoading(true)
+    setYoutubeSearchError('')
+    try {
+      const result = await window.novaPlayer.searchYoutube({ query, limit: 12 })
+      if (!result?.ok) {
+        setYoutubeSearchResults([])
+        setYoutubeSearchError(String(result?.error || 'Arama yapılamadı.'))
+        return
+      }
+      const items = Array.isArray(result.items) ? result.items : []
+      setYoutubeSearchResults(items)
+      if (!items.length) {
+        setYoutubeSearchError('Sonuç bulunamadı.')
+      }
+    } catch {
+      setYoutubeSearchResults([])
+      setYoutubeSearchError('Arama sırasında hata oluştu.')
+    } finally {
+      setYoutubeSearchLoading(false)
+    }
+  }
+
+  const handleTopbarYouTubeSearch = async () => {
+    const query = String(topbarYoutubeQuery || '').trim()
+    if (!query) {
+      setTopbarYoutubeError('Önce arama yaz.')
+      setTopbarYoutubeResults([])
+      return
+    }
+    if (!window.novaPlayer?.searchYoutube) {
+      setTopbarYoutubeError('Bu sürümde YouTube arama desteği yok.')
+      return
+    }
+    setTopbarYoutubeLoading(true)
+    setTopbarYoutubeError('')
+    setTopbarYoutubeAddingId('')
+    setTopbarYoutubeAddedIds(new Set())
+    try {
+      const result = await window.novaPlayer.searchYoutube({ query, limit: 8 })
+      if (!result?.ok) {
+        setTopbarYoutubeResults([])
+        setTopbarYoutubeError(String(result?.error || 'Arama yapılamadı.'))
+        return
+      }
+      const items = Array.isArray(result.items) ? result.items : []
+      setTopbarYoutubeResults(items)
+      if (!items.length) {
+        setTopbarYoutubeError('Sonuç bulunamadı.')
+      }
+    } catch {
+      setTopbarYoutubeResults([])
+      setTopbarYoutubeError('Arama sırasında hata oluştu.')
+    } finally {
+      setTopbarYoutubeLoading(false)
+    }
+  }
+
+  const handleTopbarYouTubeDirectAdd = async (pickedItem = null) => {
+    const item = pickedItem || topbarYoutubeResults[0]
+    if (!item?.url) {
+      showUploadNotice('Önce YouTube sonucu seç veya ara.')
+      return
+    }
+    const itemId = String(item.id || item.url || '')
+    if (itemId && topbarYoutubeAddedIds.has(itemId)) {
+      return
+    }
+    setTopbarYoutubeAddingId(itemId)
+    const created = await handleLinkAdd(
+      {
+        audioUrl: String(item.url || ''),
+        title: String(item.title || ''),
+        artist: String(item.artist || ''),
+      },
+      { keepModalOpen: false, suppressNotice: false },
+    )
+    setTopbarYoutubeAddingId('')
+    if (Array.isArray(created) && created.length) {
+      setTopbarYoutubeAddedIds((prev) => {
+        const next = new Set(prev)
+        if (itemId) {
+          next.add(itemId)
+        }
+        return next
+      })
+    }
+  }
+
+  const handleLinkAdd = async (overrides = null, options = null) => {
+    const keepModalOpen =
+      typeof options?.keepModalOpen === 'boolean' ? options.keepModalOpen : addMode === 'link'
+    const suppressNotice = Boolean(options?.suppressNotice)
+    const overrideTitle = cleanFilenameTrackTitle(String(overrides?.title || '')) || ''
+    const overrideArtist = sanitizeDisplayText(String(overrides?.artist || '')).trim()
+    const overrideUrl = normalizeDriveUrl(String(overrides?.audioUrl || ''))
+    const draftTitle = overrideTitle || cleanFilenameTrackTitle(linkDraft.title) || ''
+    const draftArtist = overrideArtist || sanitizeDisplayText(linkDraft.artist).trim()
+    const audioUrl = overrideUrl || normalizeDriveUrl(linkDraft.audioUrl)
     const coverUrlInput = normalizeDriveUrl(linkDraft.coverUrl)
 
-    if (!title || !artist || !audioUrl) {
-      showUploadNotice('Başlık, sanatçı ve link gerekli.')
-      return
+    if (!audioUrl) {
+      if (!suppressNotice) showUploadNotice('Link gerekli.')
+      return []
     }
 
-    const signature = getTrackSignature({
-      title,
-      artist,
-      audioUrl,
-      source: 'link',
-    })
+    const shouldDownloadToLibrary =
+      !/drive\.google\.com|drive\.usercontent\.google\.com/i.test(audioUrl) &&
+      !isLikelyDirectAudioUrl(audioUrl)
+    const createTrackFromResolvedSource = async ({
+      resolvedAudioUrl = '',
+      resolvedFileName = '',
+      resolvedSizeLabel = '',
+      resolvedSource = 'link',
+      titleOverride = '',
+      artistOverride = '',
+      albumOverride = '',
+      skipRemoteMeta = false,
+      orderOffset = 0,
+    }) => {
+      const fallbackName = getFileNameFromUrl(resolvedFileName || resolvedAudioUrl)
+      const parsedName = parseTrackName(fallbackName || '')
+      let title =
+        cleanFilenameTrackTitle(titleOverride || draftTitle || parsedName.title || '') || 'Bilinmeyen parça'
+      let artist =
+        sanitizeDisplayText(artistOverride || draftArtist || parsedName.artist || '').trim() ||
+        'Yerel Koleksiyon'
+      let album = sanitizeDisplayText(String(albumOverride || '').trim()) || ''
+      const durationValue = await readDuration(resolvedAudioUrl)
+      let inferredIdentity = null
+      const needsArtistInference =
+        (!artist || artist === 'Yerel Koleksiyon') &&
+        Boolean(title)
 
-    if (allTracks.some((track) => getTrackSignature(track) === signature)) {
-      showUploadNotice(`${artist} - ${title} zaten ekli.`)
-      return
-    }
+      if (needsArtistInference) {
+        try {
+          inferredIdentity = await inferTrackIdentityFromTitle(title)
+          if (inferredIdentity?.artist) {
+            artist = inferredIdentity.artist
+          }
+          if (inferredIdentity?.title) {
+            title = cleanFilenameTrackTitle(inferredIdentity.title) || title
+          }
+          if (!album && inferredIdentity?.album) {
+            album = inferredIdentity.album
+          }
+        } catch {
+          inferredIdentity = null
+        }
+      }
 
-    const cacheKey = `${normalizeArtistQuery(artist)}|${title}`.toLowerCase()
-    const remoteMeta =
-      artist && title && artist !== 'Yerel Koleksiyon'
-        ? await fetchRemoteTrackMeta(title, artist)
-        : { coverUrl: '', album: '', genre: '' }
-        setLruCacheValue(coverArtCacheRef.current, cacheKey, remoteMeta.coverUrl || '', MAX_COVER_CACHE_ENTRIES)
-        setLruCacheValue(albumCacheRef.current, cacheKey, String(remoteMeta.album || '').trim(), MAX_ALBUM_CACHE_ENTRIES)
+      let remoteCoverUrl = coverUrlInput || ''
+      let resolvedGenre = ''
+      if (!skipRemoteMeta && title && artist && artist !== 'Yerel Koleksiyon') {
+        let cacheKey = `${normalizeArtistQuery(artist)}|${title}`.toLowerCase()
+        let remoteMeta = await fetchRemoteTrackMetaSmart(title, artist, {
+          preferredAlbum: album || inferredIdentity?.album || '',
+          preferredDuration: Number(durationValue || 0),
+        })
+        if (remoteMeta?.swapped) {
+          const swappedTitle = cleanFilenameTrackTitle(artist) || title
+          const swappedArtist = sanitizeDisplayText(title) || artist
+          title = swappedTitle
+          artist = swappedArtist
+          cacheKey = `${normalizeArtistQuery(artist)}|${title}`.toLowerCase()
+        }
+        if (
+          (!remoteMeta?.coverUrl || !remoteMeta?.album || String(remoteMeta.album).trim().toLowerCase() === 'single') &&
+          title
+        ) {
+          try {
+            const fallbackIdentity = await inferTrackIdentityFromTitle(title)
+            const fallbackArtistMatches = areArtistsCompatible(
+              artist,
+              String(fallbackIdentity?.artist || ''),
+            )
+            if (fallbackArtistMatches) {
+              remoteMeta = {
+                ...remoteMeta,
+                coverUrl: remoteMeta?.coverUrl || fallbackIdentity?.coverUrl || '',
+                album: String(remoteMeta?.album || '').trim() || String(fallbackIdentity?.album || '').trim(),
+              }
+            }
+          } catch {
+            // ignore fallback lookup errors
+          }
+        }
+        if (!remoteMeta?.coverUrl) {
+          const insightFallback = await fillCoverFromAlbumInsight({
+            title,
+            artist,
+            album: String(remoteMeta?.album || album || inferredIdentity?.album || '').trim(),
+            coverUrl: String(remoteMeta?.coverUrl || inferredIdentity?.coverUrl || '').trim(),
+          })
+          remoteMeta = {
+            ...remoteMeta,
+            coverUrl: String(insightFallback.coverUrl || remoteMeta?.coverUrl || '').trim(),
+            album: String(insightFallback.album || remoteMeta?.album || '').trim(),
+          }
+        }
+        remoteCoverUrl = coverUrlInput || remoteMeta?.coverUrl || inferredIdentity?.coverUrl || ''
+        resolvedGenre = normalizeGenreName(remoteMeta?.genre || '')
+        if (!album && remoteMeta?.album) {
+          album = String(remoteMeta.album).trim()
+        }
+        if (!album && inferredIdentity?.album) {
+          album = String(inferredIdentity.album).trim()
+        }
+        setLruCacheValue(coverArtCacheRef.current, cacheKey, remoteCoverUrl, MAX_COVER_CACHE_ENTRIES)
+        setLruCacheValue(
+          albumCacheRef.current,
+          cacheKey,
+          String(remoteMeta.album || inferredIdentity?.album || '').trim(),
+          MAX_ALBUM_CACHE_ENTRIES,
+        )
         setLruCacheValue(
           genreCacheRef.current,
           cacheKey,
-          normalizeGenreName(remoteMeta.genre || ''),
+          normalizeGenreName(remoteMeta?.genre || resolvedGenre || ''),
           MAX_GENRE_CACHE_ENTRIES,
         )
-    saveJsonCache(COVER_ART_CACHE_KEY, coverArtCacheRef.current)
-    saveJsonCache(ALBUM_CACHE_KEY, albumCacheRef.current)
-    saveJsonCache(GENRE_CACHE_KEY, genreCacheRef.current)
-
-    const remoteCoverUrl = coverUrlInput || remoteMeta.coverUrl || ''
-    const durationValue = await readDuration(audioUrl)
-
-    const nextTrack = {
-      id: `link-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      title,
-      artist,
-      album: String(remoteMeta.album || '').trim() || 'Single',
-      genre: normalizeGenreName(remoteMeta.genre || ''),
-      fileName: '',
-      size: '',
-      duration: durationValue,
-      gradient: gradients[tracks.length % gradients.length],
-      audioUrl,
-      coverBlob: null,
-      coverUrl: remoteCoverUrl,
-      coverRemoteUrl: remoteCoverUrl,
-      coverTone: '',
-      coverName: coverUrlInput ? 'Bağlantı kapağı' : '',
-      isFavorite: false,
-      createdAt: Date.now(),
-      order:
-        Math.max(-1, ...allTracks.map((track, index) => getTrackSortValue(track, index))) + 1,
-      source: 'link',
+        saveJsonCache(COVER_ART_CACHE_KEY, coverArtCacheRef.current)
+        saveJsonCache(ALBUM_CACHE_KEY, albumCacheRef.current)
+        saveJsonCache(GENRE_CACHE_KEY, genreCacheRef.current)
+      }
+      return {
+        id: `link-${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${orderOffset}`,
+        title,
+        artist,
+        album: String(album || '').trim() || 'Single',
+        genre: resolvedGenre,
+        fileName: resolvedFileName || '',
+        size: resolvedSizeLabel || '',
+        duration: durationValue,
+        gradient: gradients[(tracks.length + orderOffset) % gradients.length],
+        audioUrl: resolvedAudioUrl,
+        coverBlob: null,
+        coverUrl: remoteCoverUrl,
+        coverRemoteUrl: remoteCoverUrl,
+        coverTone: '',
+        coverName: coverUrlInput ? 'Bağlantı kapağı' : '',
+        isFavorite: false,
+        createdAt: Date.now(),
+        order: Math.max(-1, ...allTracks.map((track, index) => getTrackSortValue(track, index))) + 1 + orderOffset,
+        source: resolvedSource,
+      }
     }
 
-    setTracks((prev) => [...prev, nextTrack])
-    if (!currentTrackId) {
+    const createdTracks = []
+    const existingSignatures = new Set(allTracks.map(getTrackSignature))
+
+    if (shouldDownloadToLibrary) {
+      if (!window.novaPlayer?.downloadLinkToLibrary) {
+        if (!suppressNotice) showUploadNotice('Bu sürümde link indirici desteği yok.')
+        return []
+      }
+
+      const requestId = `link-download-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+      if (!suppressNotice) showUploadNotice('Link indiriliyor, lütfen bekle...')
+      const downloadResult = await window.novaPlayer.downloadLinkToLibrary({
+        requestId,
+        url: audioUrl,
+        title: draftTitle,
+        artist: draftArtist,
+        fileName: `${draftArtist || 'Artist'} - ${draftTitle || 'Track'}.mp3`,
+      })
+
+      if (!downloadResult?.ok) {
+        const reason = String(downloadResult?.reason || '')
+        const rawError = String(downloadResult?.error || '').trim()
+        if (reason === 'yt-dlp-binary-missing') {
+          if (!suppressNotice) showUploadNotice('Dahili indirici dosyaları bulunamadı. Uygulamayı yeniden kurmayı dene.')
+        } else if (reason === 'yt-dlp-unavailable-or-failed') {
+          if (!suppressNotice) showUploadNotice(
+            rawError
+              ? `Link indirilemedi: ${rawError}`
+              : 'Link indirilemedi. Dahili indirici başlatılamadı.',
+          )
+        } else {
+          if (!suppressNotice) showUploadNotice(rawError ? `Link indirilemedi: ${rawError}` : 'Link indirilemedi.')
+        }
+        return []
+      }
+
+      const downloadedTracks = Array.isArray(downloadResult.tracks) && downloadResult.tracks.length
+        ? downloadResult.tracks
+        : [
+            {
+              fileUrl: String(downloadResult.fileUrl || ''),
+              fileName: String(downloadResult.fileName || ''),
+              size: Number(downloadResult.size || 0),
+            },
+          ]
+
+      for (const [index, item] of downloadedTracks.entries()) {
+        const resolvedAudioUrl = String(item?.fileUrl || '').trim()
+        if (!resolvedAudioUrl) {
+          continue
+        }
+        const sizeInBytes = Number(item?.size || 0)
+        const nextTrack = await createTrackFromResolvedSource({
+          resolvedAudioUrl,
+          resolvedFileName: String(item?.fileName || '').trim(),
+          resolvedSizeLabel: sizeInBytes > 0 ? `${(sizeInBytes / 1024 / 1024).toFixed(1)} MB` : '',
+          resolvedSource: 'local',
+          titleOverride: String(draftTitle || item?.title || '').trim(),
+          artistOverride: String(draftArtist || item?.artist || '').trim(),
+          albumOverride: String(item?.album || '').trim(),
+          skipRemoteMeta: false,
+          orderOffset: index,
+        })
+        const signature = getTrackSignature(nextTrack)
+        if (existingSignatures.has(signature)) {
+          continue
+        }
+        existingSignatures.add(signature)
+        createdTracks.push(nextTrack)
+      }
+    } else {
+      const nextTrack = await createTrackFromResolvedSource({
+        resolvedAudioUrl: audioUrl,
+        resolvedFileName: getFileNameFromUrl(audioUrl),
+        resolvedSizeLabel: '',
+        resolvedSource: 'link',
+        orderOffset: 0,
+      })
+      const signature = getTrackSignature(nextTrack)
+      if (existingSignatures.has(signature)) {
+        if (!suppressNotice) showUploadNotice(`${nextTrack.artist} - ${nextTrack.title} zaten ekli.`)
+        return []
+      }
+      createdTracks.push(nextTrack)
+    }
+
+    if (!createdTracks.length) {
+      if (!suppressNotice) showUploadNotice('Eklenecek yeni parça bulunamadı.')
+      return []
+    }
+
+    setTracks((prev) => [...prev, ...createdTracks])
+    if (!currentTrackId && createdTracks[0]) {
       setProgress(0)
-      setDuration(durationValue || 0)
-      setCurrentTrackId(nextTrack.id)
+      setDuration(createdTracks[0].duration || 0)
+      setCurrentTrackId(createdTracks[0].id)
       setIsPlaying(false)
       restoreSeekRef.current = 0
     }
 
-    closeAddModal()
-    showUploadNotice('Bağlantı eklendi.')
+    if (!keepModalOpen) {
+      closeAddModal()
+    }
+    if (!suppressNotice) {
+      showUploadNotice(
+        createdTracks.length > 1
+          ? `${createdTracks.length} parça eklendi.`
+          : 'Bağlantı eklendi.',
+      )
+    }
+    if (!suppressNotice && addMode === 'link') {
+      setLinkAddSuccessSignature(getLinkDraftSignature(linkDraft))
+    }
+    return createdTracks
   }
 
   const handlePoolUpload = async () => {
@@ -7171,6 +8198,23 @@ function App() {
                   }
                 }
               }
+              if (!resolvedCoverUrl) {
+                const insightFallback = await fillCoverFromAlbumInsight({
+                  title,
+                  artist,
+                  album: resolvedAlbum,
+                  coverUrl: resolvedCoverUrl,
+                })
+                if (insightFallback.coverUrl) {
+                  resolvedCoverUrl = insightFallback.coverUrl
+                }
+                if (
+                  (!resolvedAlbum || resolvedAlbum.toLowerCase() === 'single') &&
+                  insightFallback.album
+                ) {
+                  resolvedAlbum = insightFallback.album
+                }
+              }
             } catch {
               // keep current metadata if remote lookup fails
             }
@@ -7481,7 +8525,7 @@ function App() {
       ? Date.now() + TRACK_SWITCH_FADE_MS
       : 0
     if (!shouldPlay && audioRef.current) {
-      audioRef.current.volume = volume
+      audioRef.current.volume = toAudioGain(volume)
     }
     if (enforceCooldown) {
       setTrackSwitchCooldown()
@@ -7704,6 +8748,68 @@ function App() {
       // ignore toggle failures
     }
   }, [])
+
+  const seekToTime = (nextTime) => {
+    const targetTime = Number(nextTime)
+    if (!Number.isFinite(targetTime)) {
+      return
+    }
+    const audio = audioRef.current
+    if (!audio) {
+      return
+    }
+    const clampedTime = duration > 0 ? Math.min(Math.max(0, targetTime), duration) : Math.max(0, targetTime)
+    audio.currentTime = clampedTime
+    setProgress(clampedTime)
+    restoreSeekRef.current = clampedTime
+  }
+
+  const renderLyricsContent = (className = '', options = {}) => {
+    const interactive = options?.interactive == null ? parsedLyrics.hasTiming : Boolean(options?.interactive)
+    const visibleWindow = Number(options?.visibleWindow || 14)
+    if (!parsedLyrics.lines.length) {
+      return null
+    }
+    if (!parsedLyrics.hasTiming) {
+      return <pre className={`lyrics-text ${className}`.trim()}>{lyricsText}</pre>
+    }
+    const total = parsedLyrics.lines.length
+    const effectiveActive = activeLyricIndex >= 0 ? activeLyricIndex : 0
+    const halfWindow = Math.max(2, Math.floor(visibleWindow / 2))
+    const startIndex = Math.max(0, effectiveActive - halfWindow)
+    const endIndex = Math.min(total, startIndex + Math.max(4, visibleWindow))
+    const visibleLines = parsedLyrics.lines.slice(startIndex, endIndex)
+    return (
+      <div className={`lyrics-timed ${className}`.trim()}>
+        {visibleLines.map((line, offset) => {
+          const index = startIndex + offset
+          const isActive = index === activeLyricIndex
+          const isPassed = activeLyricIndex > -1 && index < activeLyricIndex
+          return (
+            <p
+              key={`lyric-line-${line.at}-${index}`}
+              className={`lyrics-line ${isActive ? 'is-active' : ''} ${isPassed ? 'is-passed' : ''}`.trim()}
+              role={interactive ? 'button' : undefined}
+              tabIndex={interactive ? 0 : undefined}
+              onClick={interactive ? () => seekToTime(line.at) : undefined}
+              onKeyDown={
+                interactive
+                  ? (event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        seekToTime(line.at)
+                      }
+                    }
+                  : undefined
+              }
+            >
+              {line.text}
+            </p>
+          )
+        })}
+      </div>
+    )
+  }
 
   const handleWindowClose = useCallback((event) => {
     event?.stopPropagation?.()
@@ -8155,6 +9261,7 @@ function App() {
       return
     }
     setArtistProfileName(normalized)
+    setArtistProfileSelectedAlbumKey('')
     setArtistProfileOpen(true)
   }, [])
 
@@ -8405,7 +9512,7 @@ function App() {
   }
 
   const saveBulkTrackChanges = async () => {
-    if (!bulkEditDrafts.length) {
+    if (!bulkEditDrafts.length && !bulkEditInitialDrafts.length) {
       closeBulkEditor()
       return
     }
@@ -8521,16 +9628,42 @@ function App() {
         updatesList.push({ id: draft.id, updates: nextUpdate })
       }
 
-      if (updatesList.length) {
+      const draftIds = new Set(bulkEditDrafts.map((item) => item.id))
+      const removedTrackIds = tracks
+        .filter((track) => !draftIds.has(track.id))
+        .map((track) => track.id)
+
+      if (updatesList.length || removedTrackIds.length) {
         saveJsonCache(COVER_ART_CACHE_KEY, coverArtCacheRef.current)
         saveJsonCache(ALBUM_CACHE_KEY, albumCacheRef.current)
-        applyBulkTrackUpdates(updatesList)
-        showUploadNotice(`${updatesList.length} şarkı güncellendi.`)
+        if (updatesList.length) {
+          applyBulkTrackUpdates(updatesList)
+        }
+        if (removedTrackIds.length) {
+          const removedSet = new Set(removedTrackIds)
+          setTracks((prev) => prev.filter((track) => !removedSet.has(track.id)))
+          setPlaylists((prev) =>
+            prev.map((playlist) => ({
+              ...playlist,
+              trackIds: playlist.trackIds.filter((id) => !removedSet.has(id)),
+            })),
+          )
+          if (removedSet.has(currentTrackId)) {
+            setCurrentTrackId(null)
+            setIsPlaying(false)
+            setProgress(0)
+            setDuration(0)
+          }
+        }
+        showUploadNotice(
+          `${updatesList.length} şarkı güncellendi, ${removedTrackIds.length} şarkı silindi.`,
+        )
       } else {
         showUploadNotice('Değişiklik bulunamadı.')
       }
       setBulkEditOpen(false)
       setBulkEditDrafts([])
+      setBulkEditInitialDrafts([])
       setBulkCoverMenuTrackId(null)
       setBulkCoverTargetTrackId(null)
     } finally {
@@ -8616,27 +9749,284 @@ function App() {
     applyQueuedNextTracks(nextIds)
   }
 
-  const createPlaylist = () => {
-    const trimmed = playlistNameDraft.trim()
-    const trimmedDescription = playlistDescriptionDraft.trim()
+  const createPlaylist = (options = {}) => {
+    const overrideName = String(options?.name || '').trim()
+    const overrideDescription = String(options?.description || '').trim()
+    const overrideCoverUrl = String(options?.coverUrl || '').trim()
+    const optionTrackIds = Array.isArray(options?.trackIds) ? options.trackIds.filter(Boolean) : null
+    const draftTxtTrackIds = Array.isArray(playlistTxtImportedTrackIds) ? playlistTxtImportedTrackIds.filter(Boolean) : []
+    const initialTrackIds = Array.from(new Set((optionTrackIds ?? draftTxtTrackIds)))
+    const keepCreatorOpen = Boolean(options?.keepCreatorOpen)
+
+    const trimmed = overrideName || playlistNameDraft.trim()
+    const trimmedDescription = overrideDescription || playlistDescriptionDraft.trim()
     if (!trimmed) {
-      return
+      return null
     }
 
     const newPlaylist = {
       id: `playlist-${Date.now()}`,
       name: trimmed,
       description: trimmedDescription,
-      trackIds: [],
+      trackIds: initialTrackIds,
       color: playlistColorDraft,
-      coverUrl: playlistCoverDraft || '',
+      coverUrl: overrideCoverUrl || playlistCoverDraft || '',
     }
 
     setPlaylists((prev) => [...prev, newPlaylist])
     setSelectedCollectionId(newPlaylist.id)
-    setCreatingPlaylist(false)
-    setPlaylistNameDraft('')
-    setPlaylistDescriptionDraft('')
+    if (!keepCreatorOpen) {
+      setCreatingPlaylist(false)
+      setPlaylistNameDraft('')
+      setPlaylistDescriptionDraft('')
+      setPlaylistTxtFileName('')
+      setPlaylistTxtImportedTrackIds([])
+      setPlaylistTxtEntriesDraft([])
+    }
+    return newPlaylist
+  }
+
+  const parsePlaylistTxtEntries = (rawText = '') => {
+    const lines = String(rawText || '')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+
+    const entries = []
+    for (const line of lines) {
+      const cleaned = line
+        .replace(/^\d+\s*[-.)]\s*/, '')
+        .replace(/^\[\d+\]\s*/, '')
+        .replace(/^[-*•]\s*/, '')
+        .trim()
+      if (!cleaned) continue
+
+      const splitByDash = cleaned.split(/\s[-–—]\s/)
+      let artist = ''
+      let title = cleaned
+      if (splitByDash.length >= 2) {
+        artist = splitByDash[0].trim()
+        title = splitByDash.slice(1).join(' - ').trim()
+      }
+
+      const query = `${artist} ${title}`.trim()
+      entries.push({
+        artist,
+        title,
+        query: query || cleaned,
+      })
+    }
+
+    return entries.filter((item) => item.query)
+  }
+
+  const pickBestMusicSearchResult = (candidate, entries = []) => {
+    if (!entries.length) return null
+    const queryNorm = normalizeCoverMatchText(candidate?.query || '')
+    const artistNorm = normalizeCoverMatchText(candidate?.artist || '')
+    const bannedVersionPattern =
+      /\b(?:slowed|slow\s*reverb|reverb|sped\s*up|spedup|nightcore|karaoke|8d|bass\s*boost(?:ed)?|live|concert|konser|performance|canli\s*performans)\b/i
+
+    let best = null
+    let bestScore = Number.NEGATIVE_INFINITY
+    for (const item of entries) {
+      const titleNorm = normalizeCoverMatchText(item?.title || '')
+      const uploaderNorm = normalizeCoverMatchText(item?.artist || '')
+      const rawTitle = String(item?.title || '')
+      const rawUploader = String(item?.artist || '')
+      if (
+        bannedVersionPattern.test(rawTitle) ||
+        bannedVersionPattern.test(rawUploader) ||
+        bannedVersionPattern.test(titleNorm) ||
+        bannedVersionPattern.test(uploaderNorm)
+      ) {
+        continue
+      }
+      const duration = Number(item?.duration || 0)
+      let score = 0
+
+      if (duration >= 60 && duration <= 12 * 60) score += 3
+      if (duration > 0 && duration < 45) score -= 6
+      if (duration > 12 * 60) score -= 2
+
+      if (queryNorm && titleNorm.includes(queryNorm)) score += 6
+      if (artistNorm && (titleNorm.includes(artistNorm) || uploaderNorm.includes(artistNorm))) score += 5
+      if (titleNorm.includes('official audio') || uploaderNorm.includes('topic')) score += 2
+      if (titleNorm.includes('music video')) score += 1
+      if (score > bestScore) {
+        bestScore = score
+        best = item
+      }
+    }
+    return best
+  }
+
+  const importPlaylistFromTxt = async (event) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+
+    try {
+      setPlaylistTxtFileName(file.name)
+      setPlaylistTxtImportedTrackIds([])
+      setPlaylistTxtEntriesDraft([])
+      const text = await file.text()
+      const entries = parsePlaylistTxtEntries(text).slice(0, 250)
+      if (!entries.length) {
+        setPlaylistTxtImportedTrackIds([])
+        showUploadNotice('TXT içinde geçerli şarkı satırı bulunamadı.')
+        return
+      }
+      setPlaylistTxtEntriesDraft(entries)
+      if (!playlistNameDraft.trim()) {
+        const fallbackName = file.name.replace(/\.[^.]+$/, '').trim()
+        if (fallbackName) {
+          setPlaylistNameDraft(fallbackName)
+        }
+      }
+      showUploadNotice(`TXT hazır: ${entries.length} satır. Oluştur'a basınca playlist'e eklenecek.`)
+    } catch {
+      showUploadNotice('TXT içe aktarma başarısız oldu.')
+    }
+  }
+
+  const createPlaylistFromDraft = async () => {
+    const fallbackName = playlistTxtFileName ? playlistTxtFileName.replace(/\.[^.]+$/, '').trim() : ''
+    const newPlaylist = createPlaylist({
+      name: playlistNameDraft.trim() || fallbackName || `Playlist ${Date.now()}`,
+      description: playlistDescriptionDraft,
+      trackIds: [],
+      keepCreatorOpen: false,
+    })
+    if (!newPlaylist) {
+      return
+    }
+
+    const pendingEntries = Array.isArray(playlistTxtEntriesDraft) ? playlistTxtEntriesDraft : []
+    if (!pendingEntries.length) {
+      showUploadNotice(`Playlist oluşturuldu: ${newPlaylist.name}`)
+      return
+    }
+    if (!window.novaPlayer?.searchYoutube) {
+      showUploadNotice('Playlist oluşturuldu, ama bu sürümde YouTube arama desteği yok.')
+      return
+    }
+
+    try {
+      playlistTxtImportCancelRef.current = false
+      setPlaylistTxtImporting(true)
+      const importedTrackIds = []
+      const progressNoticeId = `playlist-txt-import-${Date.now()}`
+      playlistTxtImportNoticeIdRef.current = progressNoticeId
+      setNotifications((prev) => [
+        {
+          id: progressNoticeId,
+          message: `TXT playlist ekleniyor... 0/${pendingEntries.length}`,
+          createdAt: Date.now(),
+          read: false,
+          actionLabel: 'Aktarmayı iptal et',
+          actionType: 'cancel-txt-import',
+        },
+        ...prev,
+      ].slice(0, 120))
+      setHasUnreadNotifications(true)
+
+      const TXT_IMPORT_CONCURRENCY = 3
+      let processedCount = 0
+      const processEntry = async (entry) => {
+        if (playlistTxtImportCancelRef.current) {
+          processedCount += 1
+          return
+        }
+        const result = await window.novaPlayer.searchYoutube({ query: entry.query, limit: 8 })
+        const items = Array.isArray(result?.items) ? result.items : []
+        const picked = pickBestMusicSearchResult(entry, items)
+        if (picked?.url) {
+          const addedTracks = await handleLinkAdd(
+            {
+              audioUrl: picked.url,
+              title: entry.title || picked.title || '',
+              artist: entry.artist || picked.artist || '',
+            },
+            { keepModalOpen: true, suppressNotice: true },
+          )
+          addedTracks.forEach((track) => {
+            if (track?.id) importedTrackIds.push(track.id)
+          })
+        }
+        processedCount += 1
+        setNotifications((prev) =>
+          prev.map((notice) =>
+            notice.id === progressNoticeId
+              ? { ...notice, message: `TXT playlist ekleniyor... ${Math.min(processedCount, pendingEntries.length)}/${pendingEntries.length}` }
+              : notice,
+          ),
+        )
+      }
+
+      for (let start = 0; start < pendingEntries.length; start += TXT_IMPORT_CONCURRENCY) {
+        if (playlistTxtImportCancelRef.current) {
+          break
+        }
+        const batch = pendingEntries.slice(start, start + TXT_IMPORT_CONCURRENCY)
+        // Aynı anda 3 arama/indirme
+        await Promise.all(
+          batch.map((entry) =>
+            processEntry(entry).catch(() => {
+              processedCount += 1
+            }),
+          ),
+        )
+      }
+
+      const uniqueIds = Array.from(new Set(importedTrackIds))
+      setPlaylistTxtImportedTrackIds(uniqueIds)
+      if (uniqueIds.length) {
+        setPlaylists((prev) => {
+          const targetIndex = prev.findIndex((playlist) => playlist.id === newPlaylist.id)
+          if (targetIndex === -1) {
+            return [
+              ...prev,
+              {
+                ...newPlaylist,
+                trackIds: Array.from(new Set([...(newPlaylist.trackIds || []), ...uniqueIds])),
+              },
+            ]
+          }
+
+          return prev.map((playlist, index) =>
+            index === targetIndex
+              ? {
+                  ...playlist,
+                  trackIds: Array.from(new Set([...(playlist.trackIds || []), ...uniqueIds])),
+                }
+              : playlist,
+          )
+        })
+      }
+
+      if (playlistTxtImportCancelRef.current) {
+        showUploadNotice(`Aktarım iptal edildi: ${newPlaylist.name} (${uniqueIds.length} parça eklendi)`)
+      } else {
+        showUploadNotice(
+          uniqueIds.length
+            ? `Playlist hazır: ${newPlaylist.name} (${uniqueIds.length} parça eklendi)`
+            : `Playlist oluşturuldu: ${newPlaylist.name}. Eşleşen müzik bulunamadı.`,
+        )
+      }
+    } catch {
+      showUploadNotice('Playlist oluşturuldu, ancak TXT şarkıları eklenirken hata oluştu.')
+    } finally {
+      const activeNoticeId = playlistTxtImportNoticeIdRef.current
+      if (activeNoticeId) {
+        setNotifications((prev) => prev.filter((notice) => notice.id !== activeNoticeId))
+      }
+      playlistTxtImportNoticeIdRef.current = ''
+      playlistTxtImportCancelRef.current = false
+      setPlaylistTxtImporting(false)
+      setPlaylistTxtEntriesDraft([])
+      setPlaylistTxtFileName('')
+    }
   }
 
   const savePlaylistChanges = () => {
@@ -8794,6 +10184,9 @@ function App() {
   const openTrackMenu = (trackId, anchorEl, pointer = null) => {
     setPlaylistContextMenuId(null)
     setPlaylistContextMenuPosition(null)
+    setDockPlaylistMenuOpen(false)
+    setPlaylistMenuTrackId(null)
+    setPlaylistMenuPosition(null)
     if (trackMenuId === trackId) {
       setTrackMenuId(null)
       setTrackMenuPosition(null)
@@ -8938,6 +10331,25 @@ function App() {
     }
   }, [])
 
+  const handleResetShortcutInputKeyDown = useCallback((event) => {
+    if (event.key === 'Tab') {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+
+    if (event.key === 'Backspace' || event.key === 'Delete' || event.key === 'Escape') {
+      setResetShortcut('Ctrl+Shift+R')
+      return
+    }
+
+    const nextShortcut = mediaShortcutFromKeyboardEvent(event)
+    if (typeof nextShortcut === 'string') {
+      setResetShortcut(nextShortcut.trim())
+    }
+  }, [])
+
   return (
     <div className={appShellLayoutClass} style={themeVars} onClick={closeMenus}>
       <div className="window-titlebar" onDoubleClick={handleWindowToggleMaximize}>
@@ -8950,7 +10362,7 @@ function App() {
             aria-label="Simge durumuna küçült"
             title="Simge durumuna küçült"
           >
-            <Minus size={14} />
+            <Minus size={30} />
           </button>
           <button
             type="button"
@@ -8959,7 +10371,7 @@ function App() {
             aria-label={windowIsMaximized ? 'Geri yükle' : 'Büyüt'}
             title={windowIsMaximized ? 'Geri yükle' : 'Büyüt'}
           >
-            {windowIsMaximized ? <Minimize2 size={13} /> : <Square size={12} />}
+            {windowIsMaximized ? <Minimize2 size={30} /> : <Square size={30} />}
           </button>
           <button
             type="button"
@@ -8968,7 +10380,7 @@ function App() {
             aria-label="Kapat"
             title="Kapat"
           >
-            <X size={14} />
+            <X size={30} />
           </button>
         </div>
       </div>
@@ -9031,57 +10443,152 @@ function App() {
             <img src={appLogo} alt="Music logo" className="topbar-logo" />
           </div>
           <h1>Music</h1>
+          <div className="topbar-youtube-search" onClick={(event) => event.stopPropagation()}>
+            <div className="topbar-youtube-search-row">
+              <input
+                type="text"
+                value={topbarYoutubeQuery}
+                onChange={(event) => {
+                  setTopbarYoutubeQuery(event.target.value)
+                  setTopbarYoutubeError('')
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    handleTopbarYouTubeSearch()
+                  }
+                }}
+                placeholder="YouTube'da ara"
+              />
+              <button
+                type="button"
+                className="mini-button ghost"
+                onClick={handleTopbarYouTubeSearch}
+                disabled={topbarYoutubeLoading}
+              >
+                <Youtube size={14} />
+                {topbarYoutubeLoading ? 'Aranıyor...' : 'Ara'}
+              </button>
+            </div>
+            {topbarYoutubeError ? <p className="field-hint">{topbarYoutubeError}</p> : null}
+            {topbarYoutubeResults.length ? (
+              <div className="topbar-youtube-results add-link-search-results">
+                {topbarYoutubeResults.map((item) => (
+                  <div
+                    key={`topbar-yt-result-${item.id}`}
+                    className="add-link-search-item topbar-youtube-result-item"
+                  >
+                    {item.thumbnail ? (
+                      <img src={item.thumbnail} alt="" className="add-link-search-item-cover" draggable={false} />
+                    ) : (
+                      <span className="add-link-search-item-cover add-link-search-item-cover-placeholder">
+                        <Youtube size={14} />
+                      </span>
+                    )}
+                    <span className="add-link-search-item-meta">
+                      <strong>{item.title}</strong>
+                      <small>{item.artist || 'Bilinmeyen sanatçı'}</small>
+                    </span>
+                    <button
+                      type="button"
+                      className={`topbar-result-download-button ${topbarYoutubeAddedIds.has(String(item.id || item.url || '')) ? 'done' : ''}`}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        handleTopbarYouTubeDirectAdd(item)
+                      }}
+                      disabled={topbarYoutubeAddingId === String(item.id || item.url || '')}
+                      title="Kütüphaneye ekle"
+                      aria-label="Kütüphaneye ekle"
+                    >
+                      {topbarYoutubeAddedIds.has(String(item.id || item.url || '')) ? (
+                        <>
+                          <Check size={14} />
+                          Eklendi
+                        </>
+                      ) : (
+                        <>
+                          <Download size={14} />
+                          İndir
+                        </>
+                      )}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
         </div>
 
         <div className="topbar-actions">
-          <button
-            className="icon-button topbar-icon-button"
-            onClick={(event) => {
-              event.stopPropagation()
-              setNotificationsOpen(false)
-              setDownloadsOpen(false)
-              setStatsOpen(true)
-            }}
-            aria-label="İstatistikler"
-          >
-            <BarChart3 size={18} />
-          </button>
-          <div className="topbar-notification-wrap">
-            <button
-              ref={notificationsButtonRef}
-              className={`icon-button topbar-icon-button ${notificationsOpen ? 'active' : ''}`}
-              onClick={(event) => {
-                event.stopPropagation()
-                setSettingsOpen(false)
-                setStatsOpen(false)
-                toggleNotificationsPanel()
-              }}
-              aria-label={t('notifications', 'Bildirimler')}
-            >
-              <Bell size={18} />
-            </button>
-            {hasUnreadNotifications ? <span className="topbar-notification-dot" /> : null}
+          <div className="topbar-utility-group">
+            <div className="topbar-utility-item">
+              <button
+                className="icon-button topbar-icon-button"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setNotificationsOpen(false)
+                  setDownloadsOpen(false)
+                  openReportIssueModal()
+                }}
+                aria-label="Hata bildir"
+                title="Hata bildir"
+              >
+                <Bug size={18} />
+              </button>
+            </div>
+            <div className="topbar-utility-item">
+              <button
+                className="icon-button topbar-icon-button"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setNotificationsOpen(false)
+                  setDownloadsOpen(false)
+                  setStatsOpen(true)
+                }}
+                aria-label="İstatistikler"
+              >
+                <BarChart3 size={18} />
+              </button>
+            </div>
+            <div className="topbar-utility-item topbar-notification-wrap">
+              <button
+                ref={notificationsButtonRef}
+                className={`icon-button topbar-icon-button ${notificationsOpen ? 'active' : ''}`}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setSettingsOpen(false)
+                  setStatsOpen(false)
+                  toggleNotificationsPanel()
+                }}
+                aria-label={t('notifications', 'Bildirimler')}
+              >
+                <Bell size={18} />
+              </button>
+              {hasUnreadNotifications ? <span className="topbar-notification-dot" /> : null}
+            </div>
+            <div className="topbar-utility-item topbar-notification-wrap">
+              <button
+                ref={downloadsButtonRef}
+                className={`icon-button topbar-icon-button ${downloadsOpen ? 'active' : ''}`}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setSettingsOpen(false)
+                  setStatsOpen(false)
+                  toggleDownloadsPanel()
+                }}
+                aria-label="İndirilenler"
+                title="İndirilenler"
+              >
+                <Download size={18} />
+              </button>
+              {activeDownloadCount > 0 ? <span className="topbar-notification-dot" /> : null}
+            </div>
+            <div className="topbar-utility-item">
+              <button className="icon-button topbar-icon-button" onClick={(event) => { event.stopPropagation(); setNotificationsOpen(false); setDownloadsOpen(false); setSettingsOpen(true) }} aria-label="Ayarlar">
+                <Settings size={18} />
+              </button>
+            </div>
           </div>
-          <div className="topbar-notification-wrap">
-            <button
-              ref={downloadsButtonRef}
-              className={`icon-button topbar-icon-button ${downloadsOpen ? 'active' : ''}`}
-              onClick={(event) => {
-                event.stopPropagation()
-                setSettingsOpen(false)
-                setStatsOpen(false)
-                toggleDownloadsPanel()
-              }}
-              aria-label="İndirilenler"
-              title="İndirilenler"
-            >
-              <Download size={18} />
-            </button>
-            {activeDownloadCount > 0 ? <span className="topbar-notification-dot" /> : null}
-          </div>
-          <button className="icon-button topbar-icon-button" onClick={(event) => { event.stopPropagation(); setNotificationsOpen(false); setDownloadsOpen(false); setSettingsOpen(true) }} aria-label="Ayarlar">
-            <Settings size={18} />
-          </button>
 
           <button className="upload-button" onClick={(event) => { event.stopPropagation(); setNotificationsOpen(false); setDownloadsOpen(false); openUploadPicker() }}>
             <Upload size={18} />
@@ -9123,6 +10630,54 @@ function App() {
                   {t('clearAllNotifications', 'Tümünü temizle')}
                 </button>
               </div>
+              {updaterUiState.supported ? (
+                <div className="updater-inline-card">
+                  <div className="updater-inline-meta">
+                    <p>
+                      {updaterUiState.downloaded
+                        ? `Güncelleme hazır${updaterUiState.latestVersion ? `: v${updaterUiState.latestVersion}` : ''}`
+                        : updaterUiState.downloading
+                          ? `Güncelleme indiriliyor${updaterUiState.latestVersion ? `: v${updaterUiState.latestVersion}` : ''}`
+                          : updaterUiState.updateAvailable
+                            ? `Yeni sürüm bulundu${updaterUiState.latestVersion ? `: v${updaterUiState.latestVersion}` : ''}`
+                            : 'Güncelleme durumu'}
+                    </p>
+                    <small>
+                      {updaterUiState.error
+                        ? updaterUiState.error
+                        : updaterUiState.downloading
+                          ? `%${Math.round(updaterUiState.progressPercent || 0)} indirildi`
+                          : updaterUiState.checking
+                            ? 'Kontrol ediliyor...'
+                            : 'Yeni sürümü kontrol edebilirsin.'}
+                    </small>
+                  </div>
+                  <div className="updater-inline-actions">
+                    <button
+                      type="button"
+                      className="mini-button ghost"
+                      onClick={handleUpdaterCheckNow}
+                      disabled={updaterUiState.checking || updaterUiState.downloading}
+                    >
+                      Kontrol et
+                    </button>
+                    <button
+                      type="button"
+                      className="mini-button"
+                      onClick={handleUpdaterInstallNow}
+                      disabled={!updaterUiState.downloaded}
+                    >
+                      Yeniden başlat ve kur
+                    </button>
+                  </div>
+                  {updaterManualCheckUpToDate ? (
+                    <div className="updater-inline-up-to-date" role="status" aria-live="polite">
+                      <Check size={14} />
+                      <span>Güncelsin!</span>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="notifications-list">
                 {notifications.length ? (
                   notifications.map((notice) => (
@@ -9130,6 +10685,29 @@ function App() {
                       <div className="notification-item-body">
                         <p>{notice.message}</p>
                         <small>{new Date(notice.createdAt).toLocaleTimeString(language === 'tr' ? 'tr-TR' : 'en-US', { hour: '2-digit', minute: '2-digit' })}</small>
+                        {notice.actionType === 'cancel-txt-import' ? (
+                          <button
+                            type="button"
+                            className="mini-button ghost"
+                            onClick={() => {
+                              playlistTxtImportCancelRef.current = true
+                              setNotifications((prev) =>
+                                prev.map((item) =>
+                                  item.id === notice.id
+                                    ? {
+                                        ...item,
+                                        actionType: '',
+                                        actionLabel: '',
+                                        message: `${item.message} (iptal ediliyor...)`,
+                                      }
+                                    : item,
+                                ),
+                              )
+                            }}
+                          >
+                            {notice.actionLabel || 'Aktarmayı iptal et'}
+                          </button>
+                        ) : null}
                       </div>
                       <button
                         type="button"
@@ -9408,7 +10986,6 @@ function App() {
                     {[
                       ['audio', t('audioOutput', 'Ses')],
                       ['appearance', t('theme', 'Görünüm')],
-                      ['playback', t('options', 'Çalma')],
                       ['system', 'Sistem'],
                       ['source', t('sharedSource', 'Kaynak')],
                       ['notes', t('notes', 'Notlar')],
@@ -9441,7 +11018,9 @@ function App() {
                   </div>
                 </aside>
 
-                <div className={`settings-content ${settingsTab === 'appearance' ? 'appearance-scroll-enabled' : ''}`}>
+                <div
+                  className={`settings-content ${settingsTab === 'appearance' ? 'appearance-scroll-enabled' : ''} ${settingsTab === 'system' ? 'system-scroll-enabled' : ''}`}
+                >
                   {settingsTab === 'audio' ? (
                     <>
                       <section className="settings-section">
@@ -9649,17 +11228,33 @@ function App() {
                     </>
                   ) : null}
 
-                  {settingsTab === 'playback' ? (
+                  {settingsTab === 'system' ? (
                     <>
-                      <section className="settings-section">
-                        <h4>{t('options', 'Ayarlar')}</h4>
-                        <p>{t('optionsHint', 'Kullanım seçeneklerini buradan açıp kapat.')}</p>
+                      <section className="settings-section system-options-scroll">
+                        <h4>{t('systemOptions', 'Sistem ayarları')}</h4>
+                        <p>{t('systemOptionsHint', 'Genel kullanım ve oynatma davranışlarını buradan yönet.')}</p>
+                        <label className="settings-toggle-row">
+                          <span>{t('resetShortcut', 'Acil reset kısayolu (Ctrl + Shift + R)')}</span>
+                          <input
+                            type="checkbox"
+                            checked={resetShortcutEnabled}
+                            onChange={(event) => setResetShortcutEnabled(event.target.checked)}
+                          />
+                        </label>
                         <label className="settings-toggle-row">
                           <span>{t('monoAudio', 'Sesi mono olarak çal')}</span>
                           <input
                             type="checkbox"
                             checked={monoAudioEnabled}
                             onChange={(event) => setMonoAudioEnabled(event.target.checked)}
+                          />
+                        </label>
+                        <label className="settings-toggle-row">
+                          <span>{t('preventSleepWhilePlaying', 'Şarkı çalarken ekranı açık tut ve uyku modunu engelle')}</span>
+                          <input
+                            type="checkbox"
+                            checked={preventSleepWhilePlayingEnabled}
+                            onChange={(event) => setPreventSleepWhilePlayingEnabled(event.target.checked)}
                           />
                         </label>
                         <label className="settings-toggle-row">
@@ -9678,28 +11273,6 @@ function App() {
                             onChange={(event) => setArrowSeekEnabled(event.target.checked)}
                           />
                         </label>
-                        <label className="settings-toggle-row">
-                          <span>{t('resetShortcut', 'Acil reset kısayolu (Ctrl + Shift + R)')}</span>
-                          <input
-                            type="checkbox"
-                            checked={resetShortcutEnabled}
-                            onChange={(event) => setResetShortcutEnabled(event.target.checked)}
-                          />
-                        </label>
-                        <label className="field settings-manifest-field">
-                          <span>{t('mediaShortcut', 'Global çal/duraklat kısayolu')}</span>
-                          <input
-                            type="text"
-                            value={mediaToggleShortcut}
-                            readOnly
-                            onKeyDown={handleMediaShortcutInputKeyDown}
-                            placeholder="Ctrl+Alt+P"
-                            title="Kısayolu kaydetmek için klavyeden kombinasyona bas. Silmek için Backspace."
-                          />
-                        </label>
-                        <small className="settings-help-text">
-                          {t('mediaShortcutHint', 'Örnek: Ctrl+Alt+P. Boş bırakırsan kapalı olur.')}
-                        </small>
                       </section>
 
                       <section className="settings-section">
@@ -9721,11 +11294,7 @@ function App() {
                           ))}
                         </div>
                       </section>
-                    </>
-                  ) : null}
 
-                  {settingsTab === 'system' ? (
-                    <>
                       <section className="settings-section">
                         <h4>{t('hardwareAcceleration', 'Donanım hızlandırma')}</h4>
                         <p>{t('hardwareAccelerationHint', 'Kapattığında uygulama yeniden başlatma ister.')}</p>
@@ -9735,6 +11304,38 @@ function App() {
                             type="checkbox"
                             checked={hardwareAccelerationEnabled}
                             onChange={(event) => setHardwareAccelerationEnabled(event.target.checked)}
+                          />
+                        </label>
+                      </section>
+
+                      <section className="settings-section">
+                        <h4>{t('mediaShortcut', 'Global çal/duraklat kısayolu')}</h4>
+                        <p>{t('mediaShortcutHint', 'Örnek: Ctrl+Alt+P. Boş bırakırsan kapalı olur.')}</p>
+                        <label className="field settings-manifest-field">
+                          <span>{t('mediaShortcut', 'Global çal/duraklat kısayolu')}</span>
+                          <input
+                            type="text"
+                            value={mediaToggleShortcut}
+                            readOnly
+                            onKeyDown={handleMediaShortcutInputKeyDown}
+                            placeholder="Ctrl+Alt+P"
+                            title="Kısayolu kaydetmek için klavyeden kombinasyona bas. Silmek için Backspace."
+                          />
+                        </label>
+                      </section>
+
+                      <section className="settings-section">
+                        <h4>{t('resetShortcut', 'Acil reset kısayolu')}</h4>
+                        <p>{t('resetShortcutHint', 'Uygulama verilerini temizleme kısayolu. Şarkılar silinmez.')}</p>
+                        <label className="field settings-manifest-field">
+                          <span>{t('resetShortcut', 'Acil reset kısayolu')}</span>
+                          <input
+                            type="text"
+                            value={resetShortcut}
+                            readOnly
+                            onKeyDown={handleResetShortcutInputKeyDown}
+                            placeholder="Ctrl+Shift+R"
+                            title="Kısayolu kaydetmek için klavyeden kombinasyona bas. Silmek için Backspace varsayılan (Ctrl+Shift+R) olur."
                           />
                         </label>
                       </section>
@@ -10178,71 +11779,263 @@ function App() {
               ) : null}
 
               {addMode === 'link' ? (
-                <div className="add-form">
-                  <label className="field">
-                    <span>Şarkı adı</span>
-                    <input
-                      type="text"
-                      value={linkDraft.title}
-                      onChange={(event) =>
-                        setLinkDraft((prev) => ({ ...prev, title: event.target.value }))
-                      }
-                      placeholder="Şarkı adı"
-                      autoFocus
-                    />
-                  </label>
+                <div className="add-link-layout">
+                  <section className="add-link-search glass">
+                    <label className="field">
+                      <span>YouTube'da ara</span>
+                      <div className="add-link-search-row">
+                        <input
+                          type="text"
+                          value={youtubeSearchQuery}
+                          onChange={(event) => setYoutubeSearchQuery(event.target.value)}
+                          placeholder="Şarkı veya sanatçı ara"
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') {
+                              event.preventDefault()
+                              handleYouTubeSearch()
+                            }
+                          }}
+                        />
+                        <button
+                          className="mini-button ghost"
+                          onClick={handleYouTubeSearch}
+                          disabled={youtubeSearchLoading}
+                        >
+                          <Youtube size={14} />
+                          {youtubeSearchLoading ? 'Aranıyor...' : 'Ara'}
+                        </button>
+                      </div>
+                    </label>
+                    {youtubeSearchError ? <p className="field-hint">{youtubeSearchError}</p> : null}
+                    <div className="add-link-search-results">
+                      {youtubeSearchResults.length ? (
+                        youtubeSearchResults.map((item) => (
+                          <button
+                            key={`yt-result-${item.id}`}
+                            type="button"
+                            className="add-link-search-item"
+                            onClick={() => {
+                              setLinkDraft((prev) => ({
+                                ...prev,
+                                title: String(item.title || '').trim() || prev.title,
+                                artist: String(item.artist || '').trim() || prev.artist,
+                                audioUrl: String(item.url || '').trim(),
+                              }))
+                            }}
+                          >
+                            {item.thumbnail ? (
+                              <img
+                                src={item.thumbnail}
+                                alt=""
+                                className="add-link-search-item-cover"
+                                draggable={false}
+                              />
+                            ) : (
+                              <span className="add-link-search-item-cover add-link-search-item-cover-placeholder">
+                                <Youtube size={14} />
+                              </span>
+                            )}
+                            <span className="add-link-search-item-meta">
+                              <span className="add-link-search-item-title">{item.title || 'Video'}</span>
+                              <span className="add-link-search-item-artist">{item.artist || ''}</span>
+                            </span>
+                          </button>
+                        ))
+                      ) : (
+                        <p className="field-hint">Arama yapınca sonuçlar burada görünecek.</p>
+                      )}
+                    </div>
+                  </section>
 
-                  <label className="field">
-                    <span>Sanatçı</span>
-                    <input
-                      type="text"
-                      value={linkDraft.artist}
-                      onChange={(event) =>
-                        setLinkDraft((prev) => ({ ...prev, artist: event.target.value }))
-                      }
-                      placeholder="Sanatçı adı"
-                    />
-                  </label>
+                  <section className="add-form add-link-form">
+                    <label className="field">
+                      <span>Şarkı adı (isteğe bağlı)</span>
+                      <input
+                        type="text"
+                        value={linkDraft.title}
+                        onChange={(event) =>
+                          setLinkDraft((prev) => ({ ...prev, title: event.target.value }))
+                        }
+                        placeholder="Şarkı adı"
+                        autoFocus
+                      />
+                    </label>
 
-                  <label className="field">
-                    <span>Drive bağlantısı</span>
-                    <input
-                      type="text"
-                      value={linkDraft.audioUrl}
-                      onChange={(event) =>
-                        setLinkDraft((prev) => ({ ...prev, audioUrl: event.target.value }))
-                      }
-                      placeholder="https://drive.google.com/file/d/..."
-                    />
-                  </label>
-                  <p className="field-hint">
-                    Drive bağlantısı ile çalsın. Şarkı ve sanatçıyı sen gir.
-                  </p>
+                    <label className="field">
+                      <span>Sanatçı (isteğe bağlı)</span>
+                      <input
+                        type="text"
+                        value={linkDraft.artist}
+                        onChange={(event) =>
+                          setLinkDraft((prev) => ({ ...prev, artist: event.target.value }))
+                        }
+                        placeholder="Sanatçı adı"
+                      />
+                    </label>
 
-                  <label className="field">
-                    <span>Kapak bağlantısı</span>
-                    <input
-                      type="text"
-                      value={linkDraft.coverUrl}
-                      onChange={(event) =>
-                        setLinkDraft((prev) => ({ ...prev, coverUrl: event.target.value }))
-                      }
-                      placeholder="Üstteki şeye bağla"
-                    />
-                  </label>
+                    <label className="field">
+                      <span>Şarkı bağlantısı</span>
+                      <input
+                        type="text"
+                        value={linkDraft.audioUrl}
+                        onChange={(event) =>
+                          setLinkDraft((prev) => ({ ...prev, audioUrl: event.target.value }))
+                        }
+                        placeholder="Drive veya YouTube linki"
+                      />
+                    </label>
+                    <p className="field-hint">
+                      Drive linki direkt eklenir. YouTube/playlist linki otomatik indirilip kütüphaneye alınır.
+                    </p>
 
-                  <div className="editor-actions">
-                    <button className="mini-button ghost" onClick={() => setAddMode('choose')}>
-                      Geri
-                    </button>
-                    <button className="mini-button primary" onClick={handleLinkAdd}>
-                      <Link2 size={14} />
-                      Linki ekle
-                    </button>
-                  </div>
+                    <label className="field">
+                      <span>Kapak bağlantısı</span>
+                      <input
+                        type="text"
+                        value={linkDraft.coverUrl}
+                        onChange={(event) =>
+                          setLinkDraft((prev) => ({ ...prev, coverUrl: event.target.value }))
+                        }
+                        placeholder="https://...jpg"
+                      />
+                    </label>
+
+                    <div className="editor-actions">
+                      <button className="mini-button ghost" onClick={() => setAddMode('choose')}>
+                        Geri
+                      </button>
+                      <button
+                        className="mini-button ghost"
+                        onClick={async () => {
+                          const first = youtubeSearchResults[0]
+                          if (!first?.url) {
+                            showUploadNotice('Önce YouTube sonucu seç veya ara.')
+                            return
+                          }
+                          await handleLinkAdd({
+                            audioUrl: first.url,
+                            title: first.title || '',
+                            artist: first.artist || '',
+                          })
+                        }}
+                      >
+                        <Youtube size={14} />
+                        İlk sonucu ekle
+                      </button>
+                      <button
+                        className={`mini-button ${linkAddSuccessSignature ? 'success' : 'primary'}`}
+                        onClick={() => handleLinkAdd()}
+                      >
+                        {linkAddSuccessSignature ? <Check size={14} /> : <Link2 size={14} />}
+                        {linkAddSuccessSignature ? 'Şarkı eklendi' : 'Linki ekle'}
+                      </button>
+                    </div>
+                  </section>
                 </div>
               ) : null}
 
+            </MotionDiv>
+          </MotionDiv>
+        ) : null}
+
+        {reportIssueOpen ? (
+          <MotionDiv
+            className="modal-backdrop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => {
+              if (!reportIssueSubmitting) {
+                setReportIssueOpen(false)
+              }
+            }}
+          >
+            <MotionDiv
+              className="modal-card glass report-issue-modal"
+              initial={{ opacity: 0, y: 18, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 18, scale: 0.98 }}
+              transition={{ duration: 0.2 }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="panel-header">
+                <div>
+                  <p className="eyebrow">Hata bildir</p>
+                  <h3>
+                    <Bug size={18} />
+                    Discord'a gönder
+                  </h3>
+                </div>
+                <div className="editor-actions">
+                  <button
+                    className="mini-button ghost"
+                    onClick={() => setReportIssueOpen(false)}
+                    disabled={reportIssueSubmitting}
+                  >
+                    <X size={14} />
+                    Kapat
+                  </button>
+                </div>
+              </div>
+
+              <div className="add-form">
+                <label className="field">
+                  <span>Başlık</span>
+                  <input
+                    type="text"
+                    maxLength={220}
+                    value={reportIssueDraft.title}
+                    onChange={(event) =>
+                      setReportIssueDraft((prev) => ({ ...prev, title: event.target.value }))
+                    }
+                    placeholder="Hata bildirinin başlığı"
+                    autoFocus
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Konu</span>
+                  <input
+                    type="text"
+                    maxLength={420}
+                    value={reportIssueDraft.subject}
+                    onChange={(event) =>
+                      setReportIssueDraft((prev) => ({ ...prev, subject: event.target.value }))
+                    }
+                    placeholder="Hata bildirisinin konusu"
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Açıklama</span>
+                  <textarea
+                    value={reportIssueDraft.description}
+                    onChange={(event) =>
+                      setReportIssueDraft((prev) => ({ ...prev, description: event.target.value }))
+                    }
+                    placeholder="Sorunun nasıl oluştuğunu adım adım yaz."
+                    rows={7}
+                  />
+                </label>
+              </div>
+
+              <div className="editor-actions">
+                <button
+                  className="mini-button ghost"
+                  onClick={() => setReportIssueOpen(false)}
+                  disabled={reportIssueSubmitting}
+                >
+                  Vazgeç
+                </button>
+                <button
+                  className="mini-button primary"
+                  onClick={submitReportIssue}
+                  disabled={reportIssueSubmitting}
+                >
+                  <Bug size={14} />
+                  {reportIssueSubmitting ? 'Gönderiliyor...' : 'Gönder'}
+                </button>
+              </div>
             </MotionDiv>
           </MotionDiv>
         ) : null}
@@ -10281,7 +12074,18 @@ function App() {
               </div>
 
               <div className="playlist-add-list">
-                {sortTracksByOrder(tracks).map((track) => {
+                <label className="field playlist-add-search-field">
+                  <span>Şarkı ara</span>
+                  <input
+                    type="text"
+                    value={playlistAddSearchQuery}
+                    onChange={(event) => setPlaylistAddSearchQuery(event.target.value)}
+                    placeholder="Tüm parçalarda ara"
+                    autoFocus
+                  />
+                </label>
+
+                {playlistAddFilteredTracks.map((track) => {
                   const alreadyInPlaylist = currentPlaylist.trackIds.includes(track.id)
 
                   return (
@@ -10311,6 +12115,9 @@ function App() {
                     </div>
                   )
                 })}
+                {!playlistAddFilteredTracks.length ? (
+                  <div className="menu-empty">Aramaya uygun şarkı bulunamadı.</div>
+                ) : null}
               </div>
             </MotionDiv>
           </MotionDiv>
@@ -10379,9 +12186,11 @@ function App() {
                       <button
                         key={`artist-album-${albumItem.key}`}
                         type="button"
-                        className="album-browser-card artist-album-card"
-                        onClick={() => openAlbumInfo(albumItem.coverTrack)}
-                        title={`${albumItem.album} albüm detayları`}
+                        className={`album-browser-card artist-album-card ${artistProfileSelectedAlbumKey === albumItem.key ? 'active' : ''}`}
+                        onClick={() => {
+                          setArtistProfileSelectedAlbumKey((prev) => (prev === albumItem.key ? '' : albumItem.key))
+                        }}
+                        title={`${albumItem.album} albümündeki şarkıları göster`}
                       >
                         <span className="album-browser-cover">
                           {getTrackDisplayUrl(albumItem.coverTrack, 'thumb') ? (
@@ -10406,6 +12215,49 @@ function App() {
                     <p className="about-text">Bu sanatçıya ait albüm bulunamadı.</p>
                   )}
                 </div>
+                {artistProfileSelectedAlbum ? (
+                  <div className="artist-selected-album-tracks">
+                    <p className="about-title">{artistProfileSelectedAlbum.album} • Şarkılar</p>
+                    <div className="artist-profile-track-list">
+                      {artistProfileSelectedAlbumTracks.map((track) => {
+                        const isAlreadyInLibrary = isTrackInLocalLibrary(track)
+                        const isPoolTrack = track.source === 'pool'
+                        return (
+                          <button
+                            key={`artist-selected-album-track-${track.id}`}
+                            type="button"
+                            className={`artist-profile-track-row ${isAlreadyInLibrary ? 'already-added' : ''}`}
+                            onClick={() => {
+                              if (isPoolTrack && !isAlreadyInLibrary) {
+                                downloadPoolTrackToLibrary(track)
+                                return
+                              }
+                              playTrack(track.id)
+                              setArtistProfileOpen(false)
+                            }}
+                          >
+                            <span className="artist-profile-track-cover">
+                              {getTrackDisplayUrl(track, 'thumb') ? (
+                                <img src={getTrackDisplayUrl(track, 'thumb')} alt="" className="track-thumb-image" />
+                              ) : (
+                                <span className="track-thumb-fallback" style={{ background: track.gradient }} />
+                              )}
+                            </span>
+                            <span className="artist-profile-track-copy">
+                              <strong>{track.title}</strong>
+                              <small>{track.artist}</small>
+                            </span>
+                            <span className={`artist-profile-track-action ${isAlreadyInLibrary ? 'added' : ''}`}>
+                              {isPoolTrack
+                                ? (isAlreadyInLibrary ? 'Eklendi' : 'Ekle')
+                                : formatTime(track.duration)}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                ) : null}
               </section>
 
               <section className="artist-profile-tracks artist-profile-local-tracks">
@@ -11459,7 +13311,7 @@ function App() {
                   <div className="player-lyrics-block">
                     <p className="about-title">Sözler</p>
                     {lyricsLoading ? <p className="about-text">Sözler yükleniyor...</p> : null}
-                    {!lyricsLoading && lyricsText ? <pre className="lyrics-text player-lyrics-text">{lyricsText}</pre> : null}
+                    {!lyricsLoading && lyricsText ? renderLyricsContent('player-lyrics-text', { visibleWindow: 18 }) : null}
                     {!lyricsLoading && !lyricsText ? (
                       <div className="player-lyrics-empty">
                         <p className="about-text">{lyricsError || 'Sözler bulunamadı.'}</p>
@@ -11923,30 +13775,43 @@ function App() {
             <AnimatePresence mode="wait">
               <MotionDiv
                 key={currentTrack.id}
-                className="fullscreen-track-scene"
+                className={`fullscreen-track-scene ${lyricsOpen ? 'with-lyrics' : ''}`.trim()}
                 initial={{ opacity: 0, y: 18, scale: 0.985 }}
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 exit={{ opacity: 0, y: -14, scale: 1.012 }}
                 transition={{ duration: 0.34, ease: 'easeOut' }}
               >
-                <div className="fullscreen-track-cover">
-                  {getTrackCoverUrl(currentTrack) ? (
-                    <img src={getTrackCoverUrl(currentTrack)} alt="Kapak önizleme" />
-                  ) : (
-                    <div className="fullscreen-track-fallback" style={{ background: currentTrack.gradient || currentThemeColor }} />
-                  )}
+                <div className="fullscreen-track-primary">
+                  <div className="fullscreen-track-cover">
+                    {getTrackCoverUrl(currentTrack) ? (
+                      <img src={getTrackCoverUrl(currentTrack)} alt="Kapak önizleme" />
+                    ) : (
+                      <div className="fullscreen-track-fallback" style={{ background: currentTrack.gradient || currentThemeColor }} />
+                    )}
+                  </div>
+                  <div className="fullscreen-track-copy">
+                    <h2 className={fullscreenTitle.className} style={fullscreenTitle.style}>{fullscreenTitle.text || 'Bir parça seç'}</h2>
+                    <p>{currentTrack.artist}</p>
+                    {fullscreenEffectsEnabled ? (
+                      <div className="fullscreen-audio-visualizer" aria-hidden>
+                        {Array.from({ length: 12 }).map((_, index) => (
+                          <span key={`viz-${index}`} style={{ '--bar-index': index }} />
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
-                <div className="fullscreen-track-copy">
-                  <h2 className={fullscreenTitle.className} style={fullscreenTitle.style}>{fullscreenTitle.text || 'Bir parça seç'}</h2>
-                  <p>{currentTrack.artist}</p>
-                  {fullscreenEffectsEnabled ? (
-                    <div className="fullscreen-audio-visualizer" aria-hidden>
-                      {Array.from({ length: 12 }).map((_, index) => (
-                        <span key={`viz-${index}`} style={{ '--bar-index': index }} />
-                      ))}
+                {lyricsOpen ? (
+                  <div className="fullscreen-inline-lyrics">
+                    <div className="fullscreen-inline-lyrics-body">
+                      {lyricsLoading ? <p>Sözler yükleniyor...</p> : null}
+                      {!lyricsLoading && lyricsError ? <p>{lyricsError}</p> : null}
+                      {!lyricsLoading && !lyricsError && lyricsText
+                        ? renderLyricsContent('fullscreen-lyrics-text', { interactive: parsedLyrics.hasTiming, visibleWindow: 10 })
+                        : null}
                     </div>
-                  ) : null}
-                </div>
+                  </div>
+                ) : null}
               </MotionDiv>
             </AnimatePresence>
 
@@ -12159,6 +14024,14 @@ function App() {
                   </span>
                 </div>
                 <div className="editor-actions">
+                  <button
+                    className="mini-button"
+                    onClick={undoBulkEdits}
+                    disabled={bulkEditSaving || !bulkEditInitialDrafts.length}
+                  >
+                    <RotateCcw size={14} />
+                    Geri al
+                  </button>
                   <button className="mini-button ghost" onClick={closeBulkEditor} disabled={bulkEditSaving}>
                     <X size={14} />
                     Kapat
@@ -12166,7 +14039,7 @@ function App() {
                   <button
                     className="mini-button primary"
                     onClick={() => saveBulkTrackChanges().catch(() => {})}
-                    disabled={bulkEditSaving || !bulkEditDrafts.length}
+                    disabled={bulkEditSaving || (!bulkEditDrafts.length && !bulkEditInitialDrafts.length)}
                   >
                     <Save size={14} />
                     {bulkEditSaving ? 'Kaydediliyor...' : 'Tümünü kaydet'}
@@ -12253,6 +14126,16 @@ function App() {
                           placeholder="Single"
                         />
                       </label>
+                      <button
+                        type="button"
+                        className="mini-button danger bulk-row-delete"
+                        onClick={() => removeBulkDraft(draft.id)}
+                        disabled={bulkEditSaving}
+                        title="Bu şarkıyı toplu kayıtta sil"
+                      >
+                        <Trash2 size={14} />
+                        Sil
+                      </button>
                     </div>
                   )
                 })}
@@ -12402,6 +14285,13 @@ function App() {
                 accept="image/*"
                 onChange={(event) => handlePlaylistCoverSelect(event, 'create')}
               />
+              <input
+                ref={playlistTxtInputRef}
+                className="hidden-input"
+                type="file"
+                accept=".txt,text/plain"
+                onChange={importPlaylistFromTxt}
+              />
               <div className="panel-header">
                 <div>
                   <p className="eyebrow">Playlist</p>
@@ -12415,7 +14305,7 @@ function App() {
                     <X size={14} />
                     Kapat
                   </button>
-                  <button className="mini-button primary" onClick={createPlaylist} disabled={!playlistNameDraft.trim()}>
+                  <button className="mini-button primary" onClick={createPlaylistFromDraft} disabled={!playlistNameDraft.trim() || playlistTxtImporting}>
                     <Plus size={14} />
                   Oluştur
                   </button>
@@ -12463,6 +14353,26 @@ function App() {
                 <button className="mini-button" onClick={() => playlistCoverInputRef.current?.click()}>
                   <ImageIcon size={14} />
                   Kapak ekle
+                </button>
+              </div>
+
+              <div className="playlist-cover-controls">
+                <div className="cover-meta">
+                  <span>TXT ile playlist aktar</span>
+                  <strong>
+                    {playlistTxtFileName
+                      ? `${playlistTxtFileName}${playlistTxtEntriesDraft.length ? ` • ${playlistTxtEntriesDraft.length} satır hazır` : ''}${playlistTxtImportedTrackIds.length ? ` • ${playlistTxtImportedTrackIds.length} parça eklendi` : ''}`
+                      : 'Seçilmedi'}
+                  </strong>
+                </div>
+
+                <button
+                  className="mini-button"
+                  onClick={() => playlistTxtInputRef.current?.click()}
+                  disabled={playlistTxtImporting}
+                >
+                  <FileUp size={14} />
+                  {playlistTxtImporting ? 'Aktarılıyor...' : 'TXT seç ve aktar'}
                 </button>
               </div>
 
@@ -12649,7 +14559,7 @@ function App() {
           )
         : null}
 
-      {lyricsOpen
+      {lyricsOpen && !fullscreenTrackOpen
         ? createPortal(
             <div
               className={`lyrics-panel ${fullscreenTrackOpen ? 'lyrics-panel--fullscreen' : ''} ${fullscreenTrackOpen && fullscreenQueueOpen ? 'lyrics-panel--with-queue' : ''}`}
@@ -12674,9 +14584,7 @@ function App() {
               <div className="lyrics-panel-body">
                 {lyricsLoading ? <p>Sözler yükleniyor...</p> : null}
                 {!lyricsLoading && lyricsError ? <p>{lyricsError}</p> : null}
-                {!lyricsLoading && !lyricsError && lyricsText ? (
-                  <pre className="lyrics-text">{lyricsText}</pre>
-                ) : null}
+                {!lyricsLoading && !lyricsError && lyricsText ? renderLyricsContent('', { visibleWindow: 18 }) : null}
               </div>
             </div>,
             document.body,
