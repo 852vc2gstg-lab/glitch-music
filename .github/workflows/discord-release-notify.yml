@@ -41,7 +41,7 @@ jobs:
                 {
                   "title": "Yeni sürüm: \($title)",
                   "url": $url,
-                  "color": 5814783,
+                  "color": ffffff,
                   "description": "Repo: **\($repo)**\nTag: **\($tag)**",
                   "fields": [
                     { "name": "Sürüm Notları", "value": $notes }
