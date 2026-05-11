@@ -12,4 +12,4 @@
 winget install python
 winget install ffmpeg
 pip install ytmusicapi
-winget install yt-dlp```
+winget install yt-dlp
