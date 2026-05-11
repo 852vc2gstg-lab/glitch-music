@@ -25,3 +25,5 @@ Yakında
 
 - Uygulamayı kurduktan sonra sol üstte bulunan Oluştur tuşuyla çalma listesi oluşturabilirsiniz. TXT ile aktar ile Playlist aktarabilirsiniz. YouTube Music çalma listelerini aktarmak için Sağ üstteki ayarlar sekmesinden Ortak kaynak bölümüne gelin. Google hesabınızı bağlayın ve playlistlerinizi aktarın.
 
+- Bir hata bulmanız durumunda [buraya](https://discord.gg/qc7t8xhUC) tıklayıp Discord sunucumuzdan bize ulaşabilirsiniz.
+
