@@ -6,6 +6,8 @@
 
 - YouTube Music altyapısı ile Windows için müzik dinleme programı. YouTube ve Spotify hesabını bağla ve playlistlerini rahatlıkla aktar. Kolay kullanılabilen arayüz.
 
+<img src="https://github.com/ghxsty-dev/glitch-music/blob/main/.github/Ads%C4%B1z%20tasar%C4%B1m(4).png?raw=true&" width="900" />
+
 ## Nasıl kurulur?
 
 - Uygulamayı GLITCH Music Setup'tan kurduktan sonra kurulum ekranından kurulur. Eksik modüller için komutlar:
@@ -29,10 +31,6 @@ Yakında
 
 - Bir hata bulmanız durumunda [buraya](https://discord.gg/qc7t8xhUC) tıklayıp Discord sunucumuzdan bize ulaşabilirsiniz.
 
-# Görseller:
-
 <img src="https://github.com/ghxsty-dev/glitch-music/blob/main/.github/Ads%C4%B1z%20tasar%C4%B1m(4).png?raw=true&" width="1200" />
-
-<img src="https://cdn.discordapp.com/attachments/1495430127817850970/1495499306063630456/GLITCHLOGO_1000_x_200_piksel.png?ex=6a02d003&is=6a017e83&hm=b275eeef0bfa4950cc60c8059c1898fe4ab6f0c13240b454b7cb7c0094a80db3&" width="1200" />
 
 
