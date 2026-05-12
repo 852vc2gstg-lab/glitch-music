@@ -31,7 +31,7 @@ Yakında
 
 # Görseller:
 
-<img src="https://cdn.discordapp.com/attachments/1495430127817850970/1503774141860282378/Adsz_tasarm4.png?ex=6a04924e&is=6a0340ce&hm=607a608ab09696182bc37fabb2327ee35271ee75f17261054ab5a306586dacb9&&" width="1200" />
+<img src="https://github.com/ghxsty-dev/glitch-music/blob/main/.github/Ads%C4%B1z%20tasar%C4%B1m(4).png?raw=true&" width="1200" />
 
 <img src="https://cdn.discordapp.com/attachments/1495430127817850970/1495499306063630456/GLITCHLOGO_1000_x_200_piksel.png?ex=6a02d003&is=6a017e83&hm=b275eeef0bfa4950cc60c8059c1898fe4ab6f0c13240b454b7cb7c0094a80db3&" width="1200" />
 
