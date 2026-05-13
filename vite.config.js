@@ -10,11 +10,10 @@ export default defineConfig({
   },
   build: {
     outDir: 'build',
-    emptyOutDir: false,
+    emptyOutDir: true,
     rollupOptions: {
       input: {
         main: fileURLToPath(new URL('./index.html', import.meta.url)),
-        admin: fileURLToPath(new URL('./admin.html', import.meta.url)),
       },
       external: ['music-metadata/lib/core', 'typedarray-to-buffer'],
     },

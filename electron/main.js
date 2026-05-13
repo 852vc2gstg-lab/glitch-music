@@ -1,26 +1,222 @@
-﻿import { app, BrowserWindow, Menu, Tray, dialog, globalShortcut, ipcMain, nativeImage, shell } from 'electron'
+﻿import { app, BrowserWindow, Menu, Tray, dialog, globalShortcut, ipcMain, nativeImage, shell, clipboard } from 'electron'
 import RPC from 'discord-rpc'
 import updaterPkg from 'electron-updater'
 import { powerSaveBlocker } from 'electron'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import { createServer } from 'node:http'
+import { createHash, randomBytes } from 'node:crypto'
+import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const { autoUpdater } = updaterPkg
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
+const projectRoot = path.resolve(__dirname, '..')
+
+const parseDotEnvContent = (content = '') => {
+  const result = {}
+  for (const rawLine of String(content).split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#')) continue
+    const eqIndex = line.indexOf('=')
+    if (eqIndex <= 0) continue
+    const key = line.slice(0, eqIndex).trim()
+    if (!key) continue
+    let value = line.slice(eqIndex + 1).trim()
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1)
+    }
+    result[key] = value
+  }
+  return result
+}
+
+const loadEnvFileIntoProcess = (filePath) => {
+  try {
+    if (!fs.existsSync(filePath)) return
+    const parsed = parseDotEnvContent(fs.readFileSync(filePath, 'utf8'))
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!String(value ?? '').trim()) continue
+      const current = String(process.env[key] ?? '').trim()
+      if (!current) {
+        process.env[key] = value
+      }
+    }
+  } catch {
+    // env parse errors should never block app startup
+  }
+}
+
+// Electron main process .env yükleme (npm start / packaged davranışı için).
+loadEnvFileIntoProcess(path.join(projectRoot, '.env'))
+loadEnvFileIntoProcess(path.join(projectRoot, '.env.local'))
+
 const discordClientId = process.env.DISCORD_CLIENT_ID || '1493213707864510464'
-const discordLargeImageKey = process.env.DISCORD_LARGE_IMAGE_KEY || 'ghxsty_music_logo'
-const discordSmallImageKey = process.env.DISCORD_SMALL_IMAGE_KEY || 'ghxsty_music_note'
+const discordLargeImageKey = process.env.DISCORD_LARGE_IMAGE_KEY || 'glitch_music_logo'
+const discordSmallImageKey = process.env.DISCORD_SMALL_IMAGE_KEY || 'glitch_music_note'
 // Sunucusuz (webhook-only) kullanım için buraya webhook URL gömülebilir.
 // Güvenlik notu: istemciye gömülen webhook herkes tarafından görülebilir.
 const BUILTIN_DISCORD_ERROR_WEBHOOK_URL = 'https://discord.com/api/webhooks/1497923192415584459/HGlmjOn2xHXiqeSwnGTXw5iVJf6ctQI-hw9A4SF9AK37HTIwg4a5J0BHYam1-1iJ3EgU'
 const discordErrorWebhookUrl = String(
   process.env.DISCORD_ERROR_WEBHOOK_URL || BUILTIN_DISCORD_ERROR_WEBHOOK_URL || '',
 ).trim()
-const isAdminMode = process.env.OPEN_ADMIN === 'true'
+const RUNTIME_AUTO_INSTALL_ENABLED = false
+const APP_PROTOCOL = 'glitchmusic'
+const CPU_CORE_COUNT = Number(process.env.NUMBER_OF_PROCESSORS || 0) || os.cpus().length || 4
+const YOUTUBE_AUTH_FILE = 'youtube-google-auth.json'
+const SPOTIFY_AUTH_FILE = 'spotify-auth.json'
+const GOOGLE_OAUTH_SCOPE = 'https://www.googleapis.com/auth/youtube.readonly'
+const GOOGLE_OAUTH_REDIRECT_PORT = 53682
+const GOOGLE_OAUTH_REDIRECT_PATH = '/oauth2callback'
+const SPOTIFY_OAUTH_SCOPE = 'playlist-read-private playlist-read-collaborative user-read-private'
+const SPOTIFY_REQUIRED_SCOPES = ['playlist-read-private', 'playlist-read-collaborative']
+const SPOTIFY_OAUTH_REDIRECT_PORT = 53683
+const SPOTIFY_OAUTH_REDIRECT_PATH = '/spotify-callback'
+
+const getLegacyUserDataCandidates = (appDataDir, currentUserData) => {
+  const candidates = new Set()
+  const pushCandidate = (value) => {
+    const normalized = path.resolve(String(value || ''))
+    if (!normalized) return
+    if (normalized === path.resolve(currentUserData)) return
+    candidates.add(normalized)
+  }
+
+  // Bilinen eski klasör adları
+  ;[
+    'Ghxsty Music',
+    'ghxsty music',
+    'GLITCH Music',
+    'glitch music',
+    'Electron',
+    'electron',
+    'music',
+    'm-zik',
+    'müzik',
+  ].forEach((name) => pushCandidate(path.join(appDataDir, name)))
+
+  // Roaming altında otomatik tarama:
+  // music, m-zik, music-backup_*, music_backup_* gibi varyasyonları yakala
+  try {
+    const entries = fs.readdirSync(appDataDir, { withFileTypes: true })
+    const dynamicPattern = /^(music([_-].+)?)$|^(m[-_]?zik([_-].+)?)$|^(ghxsty music([_-].+)?)$|^(glitch music([_-].+)?)$/i
+    for (const entry of entries) {
+      if (!entry?.isDirectory?.()) continue
+      const entryName = String(entry.name || '').trim()
+      if (!entryName) continue
+      if (!dynamicPattern.test(entryName)) continue
+      pushCandidate(path.join(appDataDir, entryName))
+    }
+  } catch {
+    // tarama hataları geri yüklemeyi tamamen engellemesin
+  }
+
+  return Array.from(candidates)
+}
+
+const migrateLegacyUserDataIfNeeded = (options = {}) => {
+  const force = Boolean(options?.force)
+  try {
+    const appDataDir = app.getPath('appData')
+    const currentUserData = app.getPath('userData')
+    const currentLibraryDir = path.join(currentUserData, 'library-audio')
+    const currentTracksFile = path.join(currentUserData, 'tracks.json')
+
+    const currentHasData =
+      (fs.existsSync(currentLibraryDir) && (fs.readdirSync(currentLibraryDir).length > 0)) ||
+      fs.existsSync(currentTracksFile)
+    if (currentHasData && !force) {
+      return { ok: true, migrated: false, reason: 'current-has-data' }
+    }
+
+    const legacyCandidates = getLegacyUserDataCandidates(appDataDir, currentUserData)
+
+    const errors = []
+    for (const legacyDir of legacyCandidates) {
+      if (!fs.existsSync(legacyDir) || legacyDir === currentUserData) continue
+      const legacyLibraryDir = path.join(legacyDir, 'library-audio')
+      const legacyTracksFile = path.join(legacyDir, 'tracks.json')
+      const legacyHasData =
+        (fs.existsSync(legacyLibraryDir) && (fs.readdirSync(legacyLibraryDir).length > 0)) ||
+        fs.existsSync(legacyTracksFile)
+      if (!legacyHasData) continue
+
+      try {
+        fs.mkdirSync(currentUserData, { recursive: true })
+
+        const importantEntries = [
+          'library-audio',
+          'tracks.json',
+          'Local Storage',
+          'IndexedDB',
+          'Session Storage',
+          'Partitions',
+          'Preferences',
+        ]
+
+        for (const entry of importantEntries) {
+          const fromPath = path.join(legacyDir, entry)
+          if (!fs.existsSync(fromPath)) continue
+          const toPath = path.join(currentUserData, entry)
+          fs.cpSync(fromPath, toPath, {
+            recursive: true,
+            force: force,
+            errorOnExist: false,
+          })
+        }
+        return { ok: true, migrated: true, from: legacyDir, to: currentUserData }
+      } catch (copyError) {
+        errors.push({
+          from: legacyDir,
+          reason: String(copyError?.message || copyError || 'copy-failed'),
+        })
+      }
+    }
+    if (errors.length) {
+      const first = errors[0]
+      return {
+        ok: false,
+        migrated: false,
+        reason: `migration-failed:${first.from}:${first.reason}`,
+        errors,
+      }
+    }
+    return { ok: true, migrated: false, reason: 'no-legacy-data' }
+  } catch (error) {
+    // migration hataları açılışı bloklamasın
+    return { ok: false, migrated: false, reason: `migration-failed:${String(error?.message || error || 'unknown')}` }
+  }
+}
+
+// Bazı sistemlerde (özellikle OneDrive/izin kısıtı olan profillerde) Chromium cache yazımı
+// ERR_FAILED ile pencerenin siyah açılmasına neden olabiliyor. Cache'i güvenli local temp'e sabitle.
+try {
+  const safeSessionDir = path.join(os.tmpdir(), 'glitch-music-session')
+  fs.mkdirSync(safeSessionDir, { recursive: true })
+  app.setPath('sessionData', safeSessionDir)
+  const safeCacheDir = path.join(os.tmpdir(), 'glitch-music-cache')
+  fs.mkdirSync(safeCacheDir, { recursive: true })
+  app.commandLine.appendSwitch('disk-cache-dir', safeCacheDir)
+  app.commandLine.appendSwitch('media-cache-dir', safeCacheDir)
+  app.commandLine.appendSwitch('disk-cache-size', String(128 * 1024 * 1024))
+  app.commandLine.appendSwitch('disable-quic')
+  // GPU'yu kapatmak yerine sadece disk tarafını güvenli tutuyoruz.
+  // Böylece özellikle tam ekran/animasyon akışında performans korunur.
+} catch {
+  // ignore cache path setup failures
+}
+
+// Renderer bellek kullanımını kontrol altında tutmak için V8 heap üst sınırı.
+// Hard cap değildir ancak ani şişmelerin büyük bölümünü engeller.
+if (!process.env.GLITCH_DISABLE_MEMORY_GUARD) {
+  app.commandLine.appendSwitch('js-flags', '--max-old-space-size=512')
+}
 
 let rpcClient = null
 let mainWindow = null
@@ -46,6 +242,1053 @@ const updaterState = {
   error: '',
 }
 let updateCheckTimer = null
+let pendingDeepLinkPayload = null
+
+const base64Url = (input) =>
+  Buffer.from(input)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '')
+
+const readYoutubeAuthState = () => {
+  try {
+    const filePath = path.join(app.getPath('userData'), YOUTUBE_AUTH_FILE)
+    if (!fs.existsSync(filePath)) return null
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    if (!parsed || typeof parsed !== 'object') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+const writeYoutubeAuthState = (state) => {
+  try {
+    const filePath = path.join(app.getPath('userData'), YOUTUBE_AUTH_FILE)
+    fs.writeFileSync(filePath, JSON.stringify(state, null, 2), 'utf8')
+    return true
+  } catch {
+    return false
+  }
+}
+
+const clearYoutubeAuthState = () => {
+  try {
+    const filePath = path.join(app.getPath('userData'), YOUTUBE_AUTH_FILE)
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath)
+    }
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+const readSpotifyAuthState = () => {
+  try {
+    const filePath = path.join(app.getPath('userData'), SPOTIFY_AUTH_FILE)
+    if (!fs.existsSync(filePath)) return null
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    if (!parsed || typeof parsed !== 'object') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+const writeSpotifyAuthState = (state) => {
+  try {
+    const filePath = path.join(app.getPath('userData'), SPOTIFY_AUTH_FILE)
+    fs.writeFileSync(filePath, JSON.stringify(state, null, 2), 'utf8')
+    return true
+  } catch {
+    return false
+  }
+}
+
+const clearSpotifyAuthState = () => {
+  try {
+    const filePath = path.join(app.getPath('userData'), SPOTIFY_AUTH_FILE)
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
+  } catch {
+    // ignore
+  }
+}
+
+const getSpotifyClientConfig = () => {
+  const normalize = (value) =>
+    String(value || '')
+      .replace(/\r?\n/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+
+  const clientId = normalize(process.env.SPOTIFY_CLIENT_ID || process.env.VITE_SPOTIFY_CLIENT_ID)
+  const clientSecret = normalize(process.env.SPOTIFY_CLIENT_SECRET || process.env.VITE_SPOTIFY_CLIENT_SECRET)
+  if (!clientId || !clientSecret) {
+    const missing = []
+    if (!clientId) missing.push('clientId')
+    if (!clientSecret) missing.push('clientSecret')
+    return { ok: false, error: `spotify-client-missing:${missing.join(',')}` }
+  }
+  return { ok: true, clientId, clientSecret }
+}
+
+const getOAuthClientConfig = (override = null) => {
+  const normalize = (value) =>
+    String(value || '')
+      .replace(/\r?\n/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+
+  const saved = readYoutubeAuthState() || {}
+  const overrideClientId = normalize(override?.clientId)
+  const overrideClientSecret = normalize(override?.clientSecret)
+  const savedClientId = normalize(saved?.clientId)
+  const savedClientSecret = normalize(saved?.clientSecret)
+  const envClientId = normalize(process.env.GOOGLE_CLIENT_ID)
+  const envClientSecret = normalize(process.env.GOOGLE_CLIENT_SECRET)
+  const viteEnvClientId = normalize(process.env.VITE_GOOGLE_CLIENT_ID)
+  const viteEnvClientSecret = normalize(process.env.VITE_GOOGLE_CLIENT_SECRET)
+
+  const clientId = overrideClientId || savedClientId || envClientId || viteEnvClientId
+  const clientSecret = overrideClientSecret || savedClientSecret || envClientSecret || viteEnvClientSecret
+
+  if (!clientId || !clientSecret) {
+    const missing = []
+    if (!clientId) missing.push('clientId')
+    if (!clientSecret) missing.push('clientSecret')
+    return { ok: false, error: `google-client-missing:${missing.join(',')}` }
+  }
+
+  return { ok: true, clientId, clientSecret }
+}
+
+const postForm = async (url, body) => {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams(body).toString(),
+  })
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    const details = String(data?.error_description || data?.error || response.statusText || 'oauth-error')
+    throw new Error(details)
+  }
+  return data
+}
+
+const fetchYoutubeChannelProfile = async (accessToken) => {
+  const response = await fetch('https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true', {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  })
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    return { ok: false, error: String(data?.error?.message || response.statusText || 'youtube-profile-failed') }
+  }
+  const first = Array.isArray(data?.items) ? data.items[0] : null
+  return {
+    ok: true,
+    channelTitle: String(first?.snippet?.title || '').trim(),
+    channelId: String(first?.id || '').trim(),
+  }
+}
+
+const ensureYoutubeAccessToken = async () => {
+  const saved = readYoutubeAuthState()
+  if (!saved?.tokens?.access_token) {
+    return { ok: false, error: 'not-connected' }
+  }
+  const configResult = getOAuthClientConfig()
+  if (!configResult?.ok) {
+    return { ok: false, error: configResult?.error || 'oauth-client-missing' }
+  }
+  const config = { clientId: configResult.clientId, clientSecret: configResult.clientSecret }
+
+  const expiresAt = Number(saved?.tokens?.expiry_date || 0)
+  const now = Date.now()
+  const hasTime = Number.isFinite(expiresAt) && expiresAt > 0
+  const isExpired = hasTime ? expiresAt - now < 60_000 : false
+
+  if (!isExpired) {
+    return { ok: true, accessToken: String(saved.tokens.access_token), state: saved }
+  }
+
+  const refreshToken = String(saved?.tokens?.refresh_token || '').trim()
+  if (!refreshToken) {
+    return { ok: false, error: 'refresh-token-missing' }
+  }
+
+  try {
+    const refreshed = await postForm('https://oauth2.googleapis.com/token', {
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+    })
+    const nextState = {
+      ...saved,
+      clientId: config.clientId,
+      clientSecret: config.clientSecret,
+      tokens: {
+        ...saved.tokens,
+        access_token: String(refreshed.access_token || ''),
+        expiry_date: Date.now() + Number(refreshed.expires_in || 3600) * 1000,
+      },
+    }
+    writeYoutubeAuthState(nextState)
+    return { ok: true, accessToken: String(nextState.tokens.access_token), state: nextState }
+  } catch (error) {
+    return { ok: false, error: String(error?.message || error || 'refresh-failed') }
+  }
+}
+
+const getYoutubeAuthStatus = async () => {
+  const saved = readYoutubeAuthState()
+  if (!saved?.tokens?.access_token) {
+    return { ok: true, connected: false }
+  }
+  const tokenResult = await ensureYoutubeAccessToken()
+  if (!tokenResult?.ok) {
+    return { ok: true, connected: false, error: tokenResult?.error || 'token-invalid' }
+  }
+  const profile = await fetchYoutubeChannelProfile(tokenResult.accessToken)
+  return {
+    ok: true,
+    connected: true,
+    channelTitle: String(profile?.channelTitle || '').trim(),
+    channelId: String(profile?.channelId || '').trim(),
+  }
+}
+
+const connectYoutubeAccount = async ({ clientId = '', clientSecret = '' } = {}) => {
+  const configResult = getOAuthClientConfig({ clientId, clientSecret })
+  if (!configResult?.ok) {
+    return { ok: false, error: configResult?.error || 'google-client-missing' }
+  }
+  const config = { clientId: configResult.clientId, clientSecret: configResult.clientSecret }
+  console.log('[YouTube OAuth] connect requested')
+
+  const codeVerifier = base64Url(randomBytes(48))
+  const codeChallenge = base64Url(createHash('sha256').update(codeVerifier).digest())
+
+  const server = createServer()
+  const authCodePromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('oauth-timeout'))
+    }, 120000)
+
+    server.on('request', (req, res) => {
+      try {
+        const target = new URL(req.url || '/', 'http://127.0.0.1')
+        if (target.pathname !== GOOGLE_OAUTH_REDIRECT_PATH) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+          res.end('<h3>You can close this tab.</h3>')
+          return
+        }
+        const code = String(target.searchParams.get('code') || '').trim()
+        const error = String(target.searchParams.get('error') || '').trim()
+        if (error) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+          res.end('<h3>Sign-in was cancelled. You can close this tab.</h3>')
+          clearTimeout(timeout)
+          resolve({ ok: false, error })
+          return
+        }
+        if (!code) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+          res.end('<h3>Code was not received. You can try again.</h3>')
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end('<h3>Sign-in successful. You can return to the app.</h3>')
+        clearTimeout(timeout)
+        resolve({ ok: true, code })
+      } catch {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
+        res.end('Auth callback error')
+      }
+    })
+  })
+
+  await new Promise((resolve, reject) => {
+    server.listen(GOOGLE_OAUTH_REDIRECT_PORT, '127.0.0.1', (error) => {
+      if (error) reject(error)
+      else resolve()
+    })
+  })
+
+  const redirectUri = `http://127.0.0.1:${GOOGLE_OAUTH_REDIRECT_PORT}${GOOGLE_OAUTH_REDIRECT_PATH}`
+  const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth')
+  authUrl.searchParams.set('client_id', config.clientId)
+  authUrl.searchParams.set('redirect_uri', redirectUri)
+  authUrl.searchParams.set('response_type', 'code')
+  authUrl.searchParams.set('scope', GOOGLE_OAUTH_SCOPE)
+  authUrl.searchParams.set('access_type', 'offline')
+  authUrl.searchParams.set('prompt', 'consent')
+  authUrl.searchParams.set('code_challenge', codeChallenge)
+  authUrl.searchParams.set('code_challenge_method', 'S256')
+
+  try {
+    await shell.openExternal(authUrl.toString())
+    console.log('[YouTube OAuth] browser opened')
+  } catch (error) {
+    return { ok: false, error: `open-external-failed: ${String(error?.message || error || 'unknown')}` }
+  }
+
+  try {
+    const codeResult = await authCodePromise
+    server.close()
+    if (!codeResult?.ok) {
+      return { ok: false, error: codeResult?.error || 'oauth-cancelled' }
+    }
+
+    const token = await postForm('https://oauth2.googleapis.com/token', {
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      code: codeResult.code,
+      code_verifier: codeVerifier,
+      grant_type: 'authorization_code',
+      redirect_uri: redirectUri,
+    })
+
+    const state = {
+      clientId: config.clientId,
+      clientSecret: config.clientSecret,
+      tokens: {
+        access_token: String(token.access_token || ''),
+        refresh_token: String(token.refresh_token || ''),
+        expiry_date: Date.now() + Number(token.expires_in || 3600) * 1000,
+      },
+    }
+    writeYoutubeAuthState(state)
+    console.log('[YouTube OAuth] token stored')
+    return getYoutubeAuthStatus()
+  } catch (error) {
+    try {
+      server.close()
+    } catch {
+      // ignore
+    }
+    const raw = String(error?.message || error || 'oauth-failed')
+    console.error('[YouTube OAuth] failed:', raw)
+    const normalized = raw.toLowerCase()
+    if (normalized.includes('redirect_uri_mismatch')) {
+      return {
+        ok: false,
+        error:
+          'redirect-uri-mismatch: This URI must be allowed in your Google Cloud OAuth client: http://127.0.0.1:53682/oauth2callback',
+      }
+    }
+    if (normalized.includes('invalid_client')) {
+      return { ok: false, error: 'invalid-client: Client ID / Secret is wrong or the OAuth client type is invalid.' }
+    }
+    if (normalized.includes('oauth-timeout')) {
+      return { ok: false, error: 'oauth-timeout: Google sign-in was not completed in the browser, or the callback could not return to the app.' }
+    }
+    return { ok: false, error: raw }
+  }
+}
+
+const listYoutubePlaylists = async () => {
+  const tokenResult = await ensureYoutubeAccessToken()
+  if (!tokenResult?.ok) {
+    return { ok: false, error: tokenResult?.error || 'not-connected' }
+  }
+
+  const playlists = []
+  let pageToken = ''
+  do {
+    const url = new URL('https://www.googleapis.com/youtube/v3/playlists')
+    url.searchParams.set('part', 'snippet,contentDetails')
+    url.searchParams.set('mine', 'true')
+    url.searchParams.set('maxResults', '50')
+    if (pageToken) {
+      url.searchParams.set('pageToken', pageToken)
+    }
+    const response = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${tokenResult.accessToken}` },
+    })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      return { ok: false, error: String(data?.error?.message || response.statusText || 'youtube-playlists-failed') }
+    }
+    for (const row of Array.isArray(data?.items) ? data.items : []) {
+      const thumbs = row?.snippet?.thumbnails || {}
+      const coverUrl =
+        String(thumbs?.medium?.url || thumbs?.high?.url || thumbs?.default?.url || '').trim()
+      playlists.push({
+        playlistId: String(row?.id || '').trim(),
+        title: String(row?.snippet?.title || '').trim(),
+        description: String(row?.snippet?.description || '').trim(),
+        trackCount: Number(row?.contentDetails?.itemCount || 0),
+        coverUrl,
+      })
+    }
+    pageToken = String(data?.nextPageToken || '').trim()
+  } while (pageToken)
+
+  return { ok: true, playlists }
+}
+
+const listYoutubePlaylistTracks = async (playlistId) => {
+  const pid = String(playlistId || '').trim()
+  if (!pid) return { ok: false, error: 'playlist-id-missing' }
+
+  const tokenResult = await ensureYoutubeAccessToken()
+  if (!tokenResult?.ok) {
+    return { ok: false, error: tokenResult?.error || 'not-connected' }
+  }
+
+  const tracks = []
+  let pageToken = ''
+  do {
+    const url = new URL('https://www.googleapis.com/youtube/v3/playlistItems')
+    url.searchParams.set('part', 'snippet,contentDetails')
+    url.searchParams.set('maxResults', '50')
+    url.searchParams.set('playlistId', pid)
+    if (pageToken) {
+      url.searchParams.set('pageToken', pageToken)
+    }
+    const response = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${tokenResult.accessToken}` },
+    })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      return { ok: false, error: String(data?.error?.message || response.statusText || 'youtube-playlist-items-failed') }
+    }
+    for (const row of Array.isArray(data?.items) ? data.items : []) {
+      const snippet = row?.snippet || {}
+      const videoId = String(row?.contentDetails?.videoId || '').trim()
+      const thumbs = snippet?.thumbnails || {}
+      tracks.push({
+        id: String(row?.id || videoId || '').trim(),
+        title: String(snippet?.title || '').trim(),
+        artist: String(snippet?.videoOwnerChannelTitle || snippet?.channelTitle || '').trim(),
+        videoId,
+        url: videoId ? `https://music.youtube.com/watch?v=${videoId}` : '',
+        coverUrl: String(thumbs?.medium?.url || thumbs?.high?.url || thumbs?.default?.url || '').trim(),
+      })
+    }
+    pageToken = String(data?.nextPageToken || '').trim()
+  } while (pageToken)
+
+  return { ok: true, tracks }
+}
+
+const spotifyApiFetch = async (accessToken, endpoint) => {
+  const response = await fetch(`https://api.spotify.com/v1${endpoint}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    return {
+      ok: false,
+      status: Number(response.status || 0) || 0,
+      error: String(data?.error?.message || response.statusText || 'spotify-api-failed'),
+    }
+  }
+  return { ok: true, data }
+}
+
+const hasSpotifyRequiredScopes = (scopeValue = '') => {
+  const granted = new Set(
+    String(scopeValue || '')
+      .split(/\s+/)
+      .map((item) => item.trim())
+      .filter(Boolean),
+  )
+  return SPOTIFY_REQUIRED_SCOPES.every((scope) => granted.has(scope))
+}
+
+const ensureSpotifyAccessToken = async () => {
+  const saved = readSpotifyAuthState()
+  if (!saved?.tokens?.access_token) return { ok: false, error: 'not-connected' }
+  if (!hasSpotifyRequiredScopes(saved?.scope)) {
+    return { ok: false, error: 'spotify-scope-missing:reconnect-required' }
+  }
+  const configResult = getSpotifyClientConfig()
+  if (!configResult?.ok) return { ok: false, error: configResult?.error || 'spotify-client-missing' }
+  const config = { clientId: configResult.clientId, clientSecret: configResult.clientSecret }
+
+  const expiresAt = Number(saved?.tokens?.expiry_date || 0)
+  const now = Date.now()
+  const hasTime = Number.isFinite(expiresAt) && expiresAt > 0
+  const isExpired = hasTime ? expiresAt - now < 60_000 : false
+  if (!isExpired) return { ok: true, accessToken: String(saved.tokens.access_token || ''), state: saved }
+
+  const refreshToken = String(saved?.tokens?.refresh_token || '').trim()
+  if (!refreshToken) return { ok: false, error: 'refresh-token-missing' }
+
+  try {
+    const response = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `Basic ${Buffer.from(`${config.clientId}:${config.clientSecret}`).toString('base64')}`,
+      },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+      }).toString(),
+    })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      return { ok: false, error: String(data?.error_description || data?.error || response.statusText || 'spotify-refresh-failed') }
+    }
+    const nextState = {
+      ...saved,
+      scope: String(saved?.scope || SPOTIFY_OAUTH_SCOPE),
+      tokens: {
+        ...saved.tokens,
+        access_token: String(data?.access_token || ''),
+        expiry_date: Date.now() + Number(data?.expires_in || 3600) * 1000,
+      },
+    }
+    writeSpotifyAuthState(nextState)
+    return { ok: true, accessToken: String(nextState.tokens.access_token || ''), state: nextState }
+  } catch (error) {
+    return { ok: false, error: String(error?.message || error || 'spotify-refresh-failed') }
+  }
+}
+
+const getSpotifyAuthStatus = async () => {
+  const saved = readSpotifyAuthState()
+  if (!saved?.tokens?.access_token) return { ok: true, connected: false }
+  if (!hasSpotifyRequiredScopes(saved?.scope)) {
+    return { ok: true, connected: false, error: 'spotify-scope-missing:reconnect-required' }
+  }
+  const tokenResult = await ensureSpotifyAccessToken()
+  if (!tokenResult?.ok) return { ok: true, connected: false, error: tokenResult?.error || 'token-invalid' }
+  const me = await spotifyApiFetch(tokenResult.accessToken, '/me')
+  const accountLabel = String(me?.data?.display_name || me?.data?.id || '').trim()
+  return { ok: true, connected: true, accountLabel }
+}
+
+const connectSpotifyAccount = async () => {
+  const configResult = getSpotifyClientConfig()
+  if (!configResult?.ok) return { ok: false, error: configResult?.error || 'spotify-client-missing' }
+  const config = { clientId: configResult.clientId, clientSecret: configResult.clientSecret }
+  const redirectUri = `http://127.0.0.1:${SPOTIFY_OAUTH_REDIRECT_PORT}${SPOTIFY_OAUTH_REDIRECT_PATH}`
+  const state = base64Url(randomBytes(24))
+
+  const server = createServer()
+  const authCodePromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('oauth-timeout')), 120000)
+    server.on('request', (req, res) => {
+      try {
+        const target = new URL(req.url || '/', 'http://127.0.0.1')
+        if (target.pathname !== SPOTIFY_OAUTH_REDIRECT_PATH) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+          res.end('<h3>You can close this tab.</h3>')
+          return
+        }
+        const returnedState = String(target.searchParams.get('state') || '').trim()
+        const code = String(target.searchParams.get('code') || '').trim()
+        const error = String(target.searchParams.get('error') || '').trim()
+        if (error) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+          res.end('<h3>Spotify sign-in was cancelled. You can close this tab.</h3>')
+          clearTimeout(timeout)
+          resolve({ ok: false, error })
+          return
+        }
+        if (!code || returnedState !== state) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+          res.end('<h3>Authorization could not be verified. You can try again.</h3>')
+          clearTimeout(timeout)
+          resolve({ ok: false, error: 'state-mismatch-or-code-missing' })
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end('<h3>Spotify connected successfully. You can return to the app.</h3>')
+        clearTimeout(timeout)
+        resolve({ ok: true, code })
+      } catch {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
+        res.end('Auth callback error')
+      }
+    })
+  })
+
+  await new Promise((resolve, reject) => {
+    server.listen(SPOTIFY_OAUTH_REDIRECT_PORT, '127.0.0.1', (error) => (error ? reject(error) : resolve()))
+  })
+
+  const authUrl = new URL('https://accounts.spotify.com/authorize')
+  authUrl.searchParams.set('client_id', config.clientId)
+  authUrl.searchParams.set('response_type', 'code')
+  authUrl.searchParams.set('redirect_uri', redirectUri)
+  authUrl.searchParams.set('scope', SPOTIFY_OAUTH_SCOPE)
+  authUrl.searchParams.set('state', state)
+  authUrl.searchParams.set('show_dialog', 'true')
+
+  try {
+    await shell.openExternal(authUrl.toString())
+  } catch (error) {
+    return { ok: false, error: `open-external-failed:${String(error?.message || error || 'unknown')}` }
+  }
+
+  try {
+    const codeResult = await authCodePromise
+    server.close()
+    if (!codeResult?.ok) return { ok: false, error: codeResult?.error || 'oauth-cancelled' }
+
+    const response = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: `Basic ${Buffer.from(`${config.clientId}:${config.clientSecret}`).toString('base64')}`,
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: codeResult.code,
+        redirect_uri: redirectUri,
+      }).toString(),
+    })
+    const token = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      return { ok: false, error: String(token?.error_description || token?.error || response.statusText || 'spotify-token-failed') }
+    }
+
+    const nextState = {
+      scope: String(token?.scope || SPOTIFY_OAUTH_SCOPE),
+      tokens: {
+        access_token: String(token?.access_token || ''),
+        refresh_token: String(token?.refresh_token || ''),
+        expiry_date: Date.now() + Number(token?.expires_in || 3600) * 1000,
+      },
+    }
+    writeSpotifyAuthState(nextState)
+    return getSpotifyAuthStatus()
+  } catch (error) {
+    try { server.close() } catch {}
+    return { ok: false, error: String(error?.message || error || 'spotify-oauth-failed') }
+  }
+}
+
+const listSpotifyPlaylists = async () => {
+  const tokenResult = await ensureSpotifyAccessToken()
+  if (!tokenResult?.ok) return { ok: false, error: tokenResult?.error || 'not-connected' }
+  const playlists = []
+  let nextUrl = '/me/playlists?limit=50'
+
+  const resolveSpotifyPlaylistTrackCount = async (playlistId, initialCount) => {
+    const parsedInitial = Number(initialCount)
+    if (Number.isFinite(parsedInitial) && parsedInitial > 0) return parsedInitial
+    const pid = String(playlistId || '').trim()
+    if (!pid) return 0
+    try {
+      const detail = await spotifyApiFetch(
+        tokenResult.accessToken,
+        `/playlists/${encodeURIComponent(pid)}?fields=tracks(total)`,
+      )
+      if (!detail?.ok) {
+        // Bazı playlistlerde Spotify detay endpoint'i 403 döndürebiliyor.
+        // Bu durumda tüm akışı kırmak yerine mevcut sayıyla devam et.
+        return Number.isFinite(parsedInitial) ? Math.max(0, parsedInitial) : 0
+      }
+      const total = Number(detail?.data?.tracks?.total)
+      return Number.isFinite(total) ? Math.max(0, total) : (Number.isFinite(parsedInitial) ? Math.max(0, parsedInitial) : 0)
+    } catch (error) {
+      return Number.isFinite(parsedInitial) ? Math.max(0, parsedInitial) : 0
+    }
+  }
+
+  while (nextUrl) {
+    const endpoint = nextUrl.startsWith('http')
+      ? nextUrl.replace('https://api.spotify.com/v1', '')
+      : nextUrl
+    const result = await spotifyApiFetch(tokenResult.accessToken, endpoint)
+    if (!result?.ok) {
+      if (Number(result?.status || 0) === 403) {
+        return { ok: false, error: 'spotify-scope-missing:reconnect-required' }
+      }
+      return { ok: false, error: result?.error || 'spotify-playlists-failed' }
+    }
+    const data = result.data || {}
+    for (const row of Array.isArray(data?.items) ? data.items : []) {
+      const image = Array.isArray(row?.images) ? row.images[0] : null
+      const rawTrackTotal =
+        row?.tracks?.total ??
+        row?.trackCount ??
+        row?.totalTracks ??
+        row?.itemsCount
+      const playlistId = String(row?.id || '').trim()
+      let trackCount = Number.isFinite(Number(rawTrackTotal)) ? Math.max(0, Number(rawTrackTotal)) : 0
+      try {
+        trackCount = await resolveSpotifyPlaylistTrackCount(playlistId, rawTrackTotal)
+      } catch {}
+      playlists.push({
+        playlistId,
+        title: String(row?.name || '').trim(),
+        description: String(row?.description || '').trim(),
+        trackCount,
+        coverUrl: String(image?.url || '').trim(),
+      })
+    }
+    nextUrl = String(data?.next || '').trim()
+  }
+  return { ok: true, playlists }
+}
+
+const listSpotifyPlaylistTracks = async (playlistId) => {
+  const pid = String(playlistId || '').trim()
+  if (!pid) return { ok: false, error: 'playlist-id-missing' }
+  const tokenResult = await ensureSpotifyAccessToken()
+  if (!tokenResult?.ok) return { ok: false, error: tokenResult?.error || 'not-connected' }
+  const collectFromEndpoint = async (initialUrl) => {
+    const collected = []
+    let nextUrl = initialUrl
+    while (nextUrl) {
+      const endpoint = nextUrl.startsWith('http')
+        ? nextUrl.replace('https://api.spotify.com/v1', '')
+        : nextUrl
+      const result = await spotifyApiFetch(tokenResult.accessToken, endpoint)
+      if (!result?.ok) {
+        return { ok: false, status: Number(result?.status || 0) || 0, error: result?.error || 'spotify-playlist-tracks-failed' }
+      }
+      const data = result.data || {}
+      for (const row of Array.isArray(data?.items) ? data.items : []) {
+        const entry = row?.track || row?.item || row || {}
+        if (!entry || typeof entry !== 'object') continue
+        const entryType = String(entry?.type || '').toLowerCase()
+        if (entryType && entryType !== 'track') continue
+        const title = String(entry?.name || '').trim()
+        if (!title) continue
+        const artists = Array.isArray(entry?.artists) ? entry.artists.map((a) => String(a?.name || '').trim()).filter(Boolean) : []
+        const image = Array.isArray(entry?.album?.images) ? entry.album.images[0] : null
+        collected.push({
+          id: String(entry?.id || row?.added_at || `${title}-${artists.join(',')}`).trim(),
+          title,
+          artist: artists.join(', '),
+          album: String(entry?.album?.name || '').trim(),
+          url: String(entry?.external_urls?.spotify || '').trim(),
+          coverUrl: String(image?.url || '').trim(),
+        })
+      }
+      nextUrl = String(data?.next || '').trim()
+    }
+    return { ok: true, tracks: collected }
+  }
+
+  // Spotify tarafında bazı hesaplarda /tracks yerine /items daha stabil.
+  const primary = await collectFromEndpoint(
+    `/playlists/${encodeURIComponent(pid)}/items?limit=100&market=from_token&additional_types=track`,
+  )
+  if (primary?.ok) {
+    return { ok: true, tracks: primary.tracks }
+  }
+  if (Number(primary?.status || 0) === 403) {
+    return { ok: false, error: 'spotify-scope-missing:reconnect-required' }
+  }
+
+  // Geriye dönük uyumluluk fallback'i
+  const fallback = await collectFromEndpoint(
+    `/playlists/${encodeURIComponent(pid)}/tracks?limit=100&market=from_token`,
+  )
+  if (fallback?.ok) {
+    return { ok: true, tracks: fallback.tracks }
+  }
+  if (Number(fallback?.status || 0) === 403) {
+    return { ok: false, error: 'spotify-scope-missing:reconnect-required' }
+  }
+
+  return { ok: false, error: fallback?.error || primary?.error || 'spotify-playlist-tracks-failed' }
+}
+
+let rendererServer = null
+let rendererServerPort = 0
+const RENDERER_HOST = '127.0.0.1'
+const RENDERER_FIXED_PORT = 31733
+
+const MIME_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+}
+
+const isLikelyImageContentTypeHeader = (value = '') => {
+  const normalized = String(value || '').toLowerCase()
+  if (!normalized) return false
+  return (
+    normalized.includes('image/') ||
+    normalized.includes('jpeg') ||
+    normalized.includes('jpg') ||
+    normalized.includes('png') ||
+    normalized.includes('webp') ||
+    normalized.includes('gif') ||
+    normalized.includes('bmp') ||
+    normalized.includes('avif')
+  )
+}
+
+const ensureRendererServer = async () => {
+  if (rendererServer && rendererServerPort) {
+    return rendererServerPort
+  }
+  const buildDir = path.join(__dirname, '..', 'build')
+  rendererServer = createServer((req, res) => {
+    try {
+      const rawUrl = String(req.url || '/')
+      const parsedUrl = new URL(rawUrl, 'http://127.0.0.1')
+      const requestedPath = decodeURIComponent(parsedUrl.pathname || '/')
+      if (requestedPath.startsWith('/local-media/')) {
+        const token = requestedPath.slice('/local-media/'.length)
+        const absolutePath = Buffer.from(token, 'base64url').toString('utf8')
+        if (!absolutePath || !fs.existsSync(absolutePath) || fs.statSync(absolutePath).isDirectory()) {
+          res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
+          res.end('Not found')
+          return
+        }
+        const ext = path.extname(absolutePath).toLowerCase()
+        const contentType = MIME_TYPES[ext] || 'application/octet-stream'
+        const stat = fs.statSync(absolutePath)
+        const totalSize = Number(stat.size || 0)
+        const rangeHeader = String(req.headers.range || '').trim()
+        res.setHeader('Accept-Ranges', 'bytes')
+
+        if (rangeHeader && /^bytes=/.test(rangeHeader) && totalSize > 0) {
+          const match = rangeHeader.match(/bytes=(\d*)-(\d*)/i)
+          let start = match?.[1] ? Number(match[1]) : 0
+          let end = match?.[2] ? Number(match[2]) : totalSize - 1
+
+          if (!Number.isFinite(start) || start < 0) start = 0
+          if (!Number.isFinite(end) || end < 0) end = totalSize - 1
+          if (start > end || start >= totalSize) {
+            res.writeHead(416, {
+              'Content-Range': `bytes */${totalSize}`,
+              'Content-Type': 'text/plain; charset=utf-8',
+            })
+            res.end('Requested Range Not Satisfiable')
+            return
+          }
+          end = Math.min(end, totalSize - 1)
+          const chunkSize = end - start + 1
+          res.writeHead(206, {
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=86400',
+            'Content-Range': `bytes ${start}-${end}/${totalSize}`,
+            'Content-Length': chunkSize,
+          })
+          fs.createReadStream(absolutePath, { start, end }).pipe(res)
+          return
+        }
+
+        res.writeHead(200, {
+          'Content-Type': contentType,
+          'Cache-Control': 'public, max-age=86400',
+          'Content-Length': totalSize,
+        })
+        fs.createReadStream(absolutePath).pipe(res)
+        return
+      }
+      if (requestedPath.startsWith('/remote-media/')) {
+        const token = requestedPath.slice('/remote-media/'.length)
+        let remoteUrl = ''
+        try {
+          remoteUrl = Buffer.from(token, 'base64url').toString('utf8')
+        } catch {
+          remoteUrl = ''
+        }
+        if (!remoteUrl || !/^https?:\/\//i.test(remoteUrl)) {
+          res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' })
+          res.end('Bad remote url')
+          return
+        }
+
+        void (async () => {
+          const buildCoverCandidates = (inputUrl) => {
+            const candidates = [inputUrl]
+            const value = String(inputUrl || '')
+            if (/ytimg\.com/i.test(value)) {
+              candidates.push(
+                value.replace('/mqdefault.jpg', '/hqdefault.jpg').replace('/default.jpg', '/hqdefault.jpg'),
+              )
+              candidates.push(
+                value.replace('/mqdefault.jpg', '/maxresdefault.jpg').replace('/default.jpg', '/maxresdefault.jpg'),
+              )
+            }
+            if (/googleusercontent\.com|ggpht\.com/i.test(value)) {
+              candidates.push(value.replace(/=w\d+-h\d+[^&]*/i, '=w1200-h1200'))
+              candidates.push(value.replace(/=s\d+[^&]*/i, '=s1200'))
+              candidates.push(value.replace(/=w\d+-h\d+[^&]*/i, '=w600-h600'))
+            }
+            return [...new Set(candidates.filter(Boolean))]
+          }
+
+          let lastError = null
+          const urlCandidates = buildCoverCandidates(remoteUrl)
+          for (const candidateUrl of urlCandidates) {
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              try {
+                const upstream = await fetch(candidateUrl, {
+                  cache: 'no-store',
+                  headers: {
+                    'user-agent':
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari',
+                  accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                  referer: 'https://music.youtube.com/',
+                },
+              })
+                if (!upstream.ok) {
+                  lastError = new Error(`upstream-${upstream.status}`)
+                  continue
+                }
+                const contentType = String(upstream.headers.get('content-type') || '').trim()
+                if (!isLikelyImageContentTypeHeader(contentType)) {
+                  lastError = new Error('invalid-content-type')
+                  continue
+                }
+                const body = Buffer.from(await upstream.arrayBuffer())
+                res.writeHead(200, {
+                  'Content-Type': contentType || 'image/jpeg',
+                  'Cache-Control': 'public, max-age=86400',
+                  'Content-Length': body.length,
+                })
+                res.end(body)
+                return
+              } catch (error) {
+                lastError = error
+              }
+            }
+          }
+          res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
+          res.end(`Remote fetch failed: ${String(lastError?.message || 'unknown')}`)
+        })()
+        return
+      }
+      const safePath = requestedPath === '/' ? '/index.html' : requestedPath
+      const normalized = path.normalize(safePath).replace(/^(\.\.[/\\])+/, '')
+      let filePath = path.join(buildDir, normalized)
+      if (!filePath.startsWith(buildDir)) {
+        res.writeHead(403)
+        res.end('Forbidden')
+        return
+      }
+      if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+        filePath = path.join(buildDir, 'index.html')
+      }
+      const ext = path.extname(filePath).toLowerCase()
+      const contentType = MIME_TYPES[ext] || 'application/octet-stream'
+      const content = fs.readFileSync(filePath)
+      res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-store' })
+      res.end(content)
+    } catch {
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end('Internal server error')
+    }
+  })
+  await new Promise((resolve, reject) => {
+    rendererServer.listen(RENDERER_FIXED_PORT, RENDERER_HOST, (error) => {
+      if (error) reject(error)
+      else resolve()
+    })
+  })
+  const address = rendererServer.address()
+  rendererServerPort = typeof address === 'object' && address ? Number(address.port || 0) : 0
+  return rendererServerPort
+}
+
+const toLocalMediaUrl = async (absolutePath) => {
+  const safePath = String(absolutePath || '').trim()
+  if (!safePath || !fs.existsSync(safePath)) {
+    return ''
+  }
+  const port = await ensureRendererServer()
+  const token = Buffer.from(safePath, 'utf8').toString('base64url')
+  return `http://${RENDERER_HOST}:${port}/local-media/${token}`
+}
+
+const loadRendererFromBuild = async (win, htmlName = 'index.html') => {
+  const port = await ensureRendererServer()
+  const sourceUrl = `http://${RENDERER_HOST}:${port}/`
+  try {
+    await win.loadURL(sourceUrl)
+    return { ok: true, from: 'http-server' }
+  } catch (firstError) {
+    const mirrorRoot = path.join(app.getPath('temp'), 'glitch-music-build-mirror')
+    const mirrorDir = path.join(mirrorRoot, 'build')
+    const mirrorHtml = path.join(mirrorDir, htmlName)
+    try {
+      fs.mkdirSync(mirrorRoot, { recursive: true })
+      fs.cpSync(path.join(__dirname, '..', 'build'), mirrorDir, { recursive: true, force: true })
+      await win.loadURL(pathToFileURL(mirrorHtml).href)
+      return { ok: true, from: 'mirror-file' }
+    } catch (mirrorError) {
+      throw new Error(
+        `build-load-failed | first=${String(firstError?.message || firstError)} | mirror=${String(
+          mirrorError?.message || mirrorError,
+        )}`,
+      )
+    }
+  }
+}
+
+const extractDeepLinkFromArgv = (argv = []) => {
+  const items = Array.isArray(argv) ? argv : []
+  for (const value of items) {
+    const text = String(value || '').trim()
+    if (!text) continue
+    if (text.toLowerCase().startsWith(`${APP_PROTOCOL}://`)) {
+      return text
+    }
+  }
+  return ''
+}
+
+const parseDeepLinkPayload = (link) => {
+  try {
+    const raw = String(link || '').trim()
+    if (!raw.toLowerCase().startsWith(`${APP_PROTOCOL}://`)) {
+      return null
+    }
+    const parsed = new URL(raw)
+    const action = String(parsed.hostname || '').toLowerCase()
+    if (action !== 'play') {
+      return null
+    }
+    const id = String(parsed.searchParams.get('id') || '').trim()
+    const title = String(parsed.searchParams.get('title') || '').trim()
+    const artist = String(parsed.searchParams.get('artist') || '').trim()
+    const audioUrl = String(parsed.searchParams.get('url') || '').trim()
+    if (!id && !audioUrl && !title) {
+      return null
+    }
+    return {
+      action: 'play',
+      id,
+      title,
+      artist,
+      audioUrl,
+      raw,
+    }
+  } catch {
+    return null
+  }
+}
+
+const dispatchDeepLinkPayload = (payload) => {
+  if (!payload) return
+  pendingDeepLinkPayload = payload
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+  mainWindow.webContents.send('app:deep-link', payload)
+}
 
 const formatUpdaterError = (error) => {
   const raw = String(error?.message || error || 'updater-error')
@@ -136,7 +1379,11 @@ const resetUpdaterState = () => {
   }, 'reset')
 }
 
-const isUpdaterSupported = () => app.isPackaged && !isAdminMode
+const isUpdaterSupported = () => app.isPackaged
+const isLatestYmlMissingError = (errorLike) => {
+  const message = String(errorLike?.message || errorLike || '').toLowerCase()
+  return message.includes('latest.yml') && message.includes('404')
+}
 
 const setupAutoUpdater = () => {
   if (!isUpdaterSupported()) {
@@ -175,17 +1422,6 @@ const setupAutoUpdater = () => {
       latestVersion: String(info?.version || ''),
       error: '',
     }, 'available')
-
-    // Uygulama iÃ§i bildirim kullan: popup aÃ§madan arka planda indir.
-    try {
-      syncUpdaterState({ downloading: true, error: '' }, 'download-start')
-      await autoUpdater.downloadUpdate()
-    } catch (error) {
-      syncUpdaterState({
-        downloading: false,
-        error: formatUpdaterError(error),
-      }, 'error')
-    }
   })
 
   autoUpdater.on('update-not-available', () => {
@@ -225,6 +1461,18 @@ const setupAutoUpdater = () => {
   })
 
   autoUpdater.on('error', (error) => {
+    if (isLatestYmlMissingError(error)) {
+      // latest.yml eksikse updater'ı hata moduna sokma; sessizce "güncelleme yok" durumuna dön.
+      syncUpdaterState({
+        checking: false,
+        updateAvailable: false,
+        downloading: false,
+        downloaded: false,
+        progressPercent: 0,
+        error: '',
+      }, 'not-available')
+      return
+    }
     syncUpdaterState({
       checking: false,
       downloading: false,
@@ -242,6 +1490,17 @@ const triggerUpdateCheck = async () => {
     await autoUpdater.checkForUpdates()
     return { ok: true }
   } catch (error) {
+    if (isLatestYmlMissingError(error)) {
+      syncUpdaterState({
+        checking: false,
+        updateAvailable: false,
+        downloading: false,
+        downloaded: false,
+        progressPercent: 0,
+        error: '',
+      }, 'not-available')
+      return { ok: false, reason: 'latest-yml-missing' }
+    }
     const message = formatUpdaterError(error)
     syncUpdaterState({ checking: false, error: message }, 'error')
     return { ok: false, reason: message }
@@ -287,7 +1546,7 @@ const sendDiscordErrorReport = async ({
     : contextJson
 
   const payload = {
-    username: 'Ghxsty Music Hata Botu',
+    username: 'GLITCH Music Hata Botu',
     embeds: [
       {
         title: normalizedTitle || 'Yeni Hata Bildirimi',
@@ -304,12 +1563,12 @@ const sendDiscordErrorReport = async ({
           },
           {
             name: 'Uygulama',
-            value: `Music v${app.getVersion()} (${process.platform})`,
+            value: `GLITCH Music v${app.getVersion()} (${process.platform})`,
             inline: true,
           },
           {
             name: 'Kaynak',
-            value: isAdminMode ? 'admin' : 'main',
+            value: 'main',
             inline: true,
           },
           {
@@ -407,9 +1666,15 @@ const syncCustomMediaShortcut = () => {
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) {
   app.quit()
+  app.exit(0)
 }
 
-app.on('second-instance', () => {
+app.on('second-instance', (_, commandLine = []) => {
+  const deepLink = extractDeepLinkFromArgv(commandLine)
+  if (deepLink) {
+    dispatchDeepLinkPayload(parseDeepLinkPayload(deepLink))
+  }
+
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
   }
@@ -420,6 +1685,11 @@ app.on('second-instance', () => {
 
   mainWindow.show()
   mainWindow.focus()
+})
+
+app.on('open-url', (event, url) => {
+  event.preventDefault()
+  dispatchDeepLinkPayload(parseDeepLinkPayload(url))
 })
 
 const performAppReset = () => {
@@ -457,8 +1727,20 @@ resetShortcutEnabled = runtimePrefs.resetShortcutEnabled !== false
 resetShortcut = String(runtimePrefs.resetShortcut || 'Ctrl+Shift+R').trim()
 mediaToggleShortcut = String(runtimePrefs.mediaToggleShortcut || '').trim()
 preventSleepWhilePlayingEnabled = runtimePrefs.preventSleepWhilePlayingEnabled !== false
+let launchOnStartupEnabled = runtimePrefs.launchOnStartupEnabled === true
 if (!hardwareAccelerationEnabled) {
   app.disableHardwareAcceleration()
+}
+
+const syncLaunchOnStartupSetting = () => {
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: Boolean(launchOnStartupEnabled),
+      openAsHidden: true,
+    })
+  } catch {
+    // ignore startup registration issues
+  }
 }
 
 const getLogoPath = () => {
@@ -583,11 +1865,11 @@ ipcMain.handle('updater:get-state', async () => ({
 ipcMain.handle('updater:check', async () => triggerUpdateCheck())
 
 ipcMain.handle('updater:download', async () => {
-  if (!isUpdaterSupported()) {
-    return { ok: false, reason: 'unsupported' }
+  if (!isUpdaterSupported() || !updaterState.updateAvailable || updaterState.downloaded) {
+    return { ok: false, reason: 'not-ready' }
   }
   try {
-    syncUpdaterState({ downloading: true, error: '' }, 'download-start')
+    syncUpdaterState({ downloading: true, error: '' }, 'download-started')
     await autoUpdater.downloadUpdate()
     return { ok: true }
   } catch (error) {
@@ -620,6 +1902,349 @@ ipcMain.handle('report:issue', async (_, payload) => {
 ipcMain.handle('app:reset', async () => {
   performAppReset()
   return { ok: true }
+})
+
+ipcMain.handle('app:get-pending-deep-link', async () => {
+  const payload = pendingDeepLinkPayload
+  pendingDeepLinkPayload = null
+  return payload || null
+})
+
+ipcMain.handle('app:copy-text', async (_, payload) => {
+  const text = String(payload?.text || '').trim()
+  if (!text) {
+    return { ok: false, reason: 'empty-text' }
+  }
+  try {
+    clipboard.writeText(text)
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, reason: String(error?.message || error || 'copy-failed') }
+  }
+})
+
+ipcMain.handle('data:restore-legacy', async () => {
+  try {
+    const result = migrateLegacyUserDataIfNeeded({ force: true })
+    return result || { ok: true, migrated: false, reason: 'no-result' }
+  } catch (error) {
+    return { ok: false, migrated: false, reason: String(error?.message || error || 'restore-failed') }
+  }
+})
+
+ipcMain.handle('data:factory-reset', async () => {
+  try {
+    const appDataDir = app.getPath('appData')
+    const userDataDir = app.getPath('userData')
+    const currentName = path.basename(String(userDataDir || ''))
+    const wipeTargets = new Set([
+      userDataDir,
+      path.join(appDataDir, 'Electron'),
+      path.join(appDataDir, 'electron'),
+      path.join(appDataDir, 'music'),
+      path.join(appDataDir, 'm-zik'),
+      path.join(appDataDir, 'müzik'),
+      path.join(appDataDir, 'Ghxsty Music'),
+      path.join(appDataDir, 'ghxsty music'),
+      path.join(appDataDir, 'GLITCH Music'),
+      path.join(appDataDir, 'glitch music'),
+    ])
+
+    try {
+      const entries = fs.readdirSync(appDataDir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (!entry?.isDirectory?.()) continue
+        const name = String(entry.name || '').trim()
+        if (!name) continue
+        if (/^(music([_-].+)?)$|^(m[-_]?zik([_-].+)?)$|^(ghxsty music([_-].+)?)$|^(glitch music([_-].+)?)$/i.test(name)) {
+          wipeTargets.add(path.join(appDataDir, name))
+        }
+      }
+    } catch {
+      // best effort
+    }
+
+    const targets = Array.from(wipeTargets).map((value) => path.resolve(String(value || ''))).filter(Boolean)
+    const removed = []
+    const failed = []
+
+    const wipeDirContents = (dirPath) => {
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true })
+      for (const entry of entries) {
+        const entryPath = path.join(dirPath, entry.name)
+        try {
+          fs.rmSync(entryPath, { recursive: true, force: true, maxRetries: 2, retryDelay: 80 })
+          removed.push(entryPath)
+        } catch (error) {
+          failed.push({ target: entryPath, reason: String(error?.message || error || 'remove-failed') })
+        }
+      }
+    }
+
+    for (const target of targets) {
+      try {
+        if (!fs.existsSync(target)) continue
+        const sameAsCurrent = path.resolve(target) === path.resolve(userDataDir)
+        if (sameAsCurrent) {
+          // Çalışan profil klasörünü komple kaldırmak yerine içeriğini temizle.
+          wipeDirContents(target)
+          continue
+        }
+        fs.rmSync(target, { recursive: true, force: true, maxRetries: 2, retryDelay: 80 })
+        removed.push(target)
+      } catch (error) {
+        failed.push({ target, reason: String(error?.message || error || 'remove-failed') })
+      }
+    }
+
+    if (removed.length > 0) {
+      setTimeout(() => {
+        try {
+          app.relaunch()
+        } catch {
+          // ignore relaunch failures
+        }
+        try {
+          app.exit(0)
+        } catch {
+          // ignore exit failures
+        }
+      }, 120)
+    }
+
+    return {
+      ok: removed.length > 0 && failed.length === 0,
+      currentProfile: currentName,
+      removedCount: removed.length,
+      failedCount: failed.length,
+      removed,
+      failed,
+    }
+  } catch (error) {
+    return { ok: false, reason: String(error?.message || error || 'factory-reset-failed') }
+  }
+})
+
+ipcMain.handle('data:list-local-library-files', async () => {
+  try {
+    const libraryDir = path.join(app.getPath('userData'), 'library-audio')
+    if (!fs.existsSync(libraryDir)) {
+      return { ok: true, files: [] }
+    }
+    const entries = fs.readdirSync(libraryDir, { withFileTypes: true })
+    const audioPattern = /\.(mp3|wav|flac|m4a|aac|ogg|opus|webm|weba|mp4|mkv|m4b)$/i
+    const files = []
+    for (const entry of entries) {
+      if (!entry?.isFile?.()) continue
+      const fileName = String(entry.name || '').trim()
+      if (!fileName || !audioPattern.test(fileName)) continue
+      const absolutePath = path.join(libraryDir, fileName)
+      let stat = null
+      try {
+        stat = fs.statSync(absolutePath)
+      } catch {
+        stat = null
+      }
+      const audioUrl = await toLocalMediaUrl(absolutePath)
+      files.push({
+        fileName,
+        audioUrl,
+        sizeBytes: Number(stat?.size || 0),
+        mtimeMs: Number(stat?.mtimeMs || Date.now()),
+      })
+    }
+    return { ok: true, files }
+  } catch (error) {
+    return { ok: false, error: String(error?.message || error || 'list-local-library-failed') }
+  }
+})
+
+ipcMain.handle('check:dependencies', async () => {
+  const commandExists = (cmd) => {
+    try {
+      const result = spawnSync('where', [cmd], { stdio: 'ignore', timeout: 3000 })
+      return result.status === 0
+    } catch {
+      return false
+    }
+  }
+  const canRunCommand = (cmd, args = ['--version']) => {
+    if (!commandExists(cmd)) {
+      return false
+    }
+    try {
+      const result = spawnSync(cmd, args, { stdio: 'ignore', timeout: 5000 })
+      return result.status === 0
+    } catch {
+      return false
+    }
+  }
+  const canRunPython = () => canRunCommand('python', ['-V']) || canRunCommand('py', ['-V']) || canRunCommand('python3', ['-V'])
+
+  const checkPythonPackage = async (packageName) => {
+    const pythonCandidates = process.platform === 'win32' ? ['py', 'python', 'python3'] : ['python3', 'python']
+    for (const command of pythonCandidates) {
+      try {
+        const result = spawnSync(command, ['-m', 'pip', 'show', packageName], {
+          stdio: 'ignore',
+          timeout: 5000,
+        })
+        if (result.status === 0) {
+          return true
+        }
+      } catch {
+        // try next python executable
+      }
+    }
+    return false
+  }
+
+  const dependencies = {
+    'yt-dlp': canRunCommand('yt-dlp', ['--version']),
+    'ffmpeg': canRunCommand('ffmpeg', ['-version']),
+    python: canRunPython(),
+  }
+
+  let ytmusicapi = false
+  if (dependencies.python) {
+    ytmusicapi = await checkPythonPackage('ytmusicapi')
+  }
+
+  return {
+    available: dependencies,
+    ytmusicapi,
+    missing: Object.entries(dependencies)
+      .filter(([, available]) => !available)
+      .map(([name]) => name),
+    missingPython: dependencies.python ? (!ytmusicapi ? ['ytmusicapi'] : []) : [],
+  }
+})
+
+ipcMain.handle('dependencies:auto-install', async () => {
+  if (!RUNTIME_AUTO_INSTALL_ENABLED) {
+    return {
+      ok: false,
+      reason: 'runtime-auto-install-disabled',
+      logs: [
+        'Runtime otomatik kurulum devre dışı.',
+        'Uygulama çalışırken winget/exe indirme ve kurma akışları kapatıldı.',
+      ],
+    }
+  }
+  const installLogs = []
+  const log = (message = '') => {
+    installLogs.push(String(message || '').trim())
+  }
+
+  const commandExists = (cmd) => {
+    try {
+      const result = spawnSync('where', [cmd], { stdio: 'ignore', timeout: 3000 })
+      return result.status === 0
+    } catch {
+      return false
+    }
+  }
+  const canRunCommand = (cmd, args = ['--version']) => {
+    if (!commandExists(cmd)) {
+      return false
+    }
+    try {
+      const result = spawnSync(cmd, args, { stdio: 'ignore', timeout: 5000 })
+      return result.status === 0
+    } catch {
+      return false
+    }
+  }
+  const canRunPython = () => canRunCommand('python', ['-V']) || canRunCommand('py', ['-V']) || canRunCommand('python3', ['-V'])
+
+  const runWingetInstall = async (packageId) => {
+    const result = await runPythonCommand('winget', [
+      'install',
+      '--id',
+      packageId,
+      '-e',
+      '--silent',
+      '--accept-package-agreements',
+      '--accept-source-agreements',
+    ])
+    return result.ok
+  }
+  const checkPythonPackage = async (packageName) => {
+    const pythonCandidates = process.platform === 'win32' ? ['py', 'python', 'python3'] : ['python3', 'python']
+    for (const command of pythonCandidates) {
+      try {
+        const result = spawnSync(command, ['-m', 'pip', 'show', packageName], {
+          stdio: 'ignore',
+          timeout: 5000,
+        })
+        if (result.status === 0) {
+          return true
+        }
+      } catch {
+        // try next python executable
+      }
+    }
+    return false
+  }
+
+  try {
+    if (process.platform !== 'win32') {
+      return { ok: false, reason: 'unsupported-platform', logs: ['Otomatik kurulum şu an sadece Windows için mevcut.'] }
+    }
+    if (!commandExists('winget')) {
+      return { ok: false, reason: 'winget-missing', logs: ['winget bulunamadı.'] }
+    }
+
+    const status = {
+      python: canRunPython(),
+      ytdlp: canRunCommand('yt-dlp', ['--version']),
+      ffmpeg: canRunCommand('ffmpeg', ['-version']),
+    }
+
+    if (!status.python) {
+      log('Python kuruluyor...')
+      const ok = await runWingetInstall('Python.Python.3.12')
+      log(ok ? 'Python kuruldu.' : 'Python kurulamadı.')
+    }
+    if (!status.ytdlp) {
+      log('yt-dlp kuruluyor...')
+      const ok = await runWingetInstall('yt-dlp')
+      log(ok ? 'yt-dlp kuruldu.' : 'yt-dlp kurulamadı.')
+    }
+    if (!status.ffmpeg) {
+      log('ffmpeg kuruluyor...')
+      const ok = await runWingetInstall('Gyan.FFmpeg')
+      log(ok ? 'ffmpeg kuruldu.' : 'ffmpeg kurulamadı.')
+    }
+
+    log('ytmusicapi kontrol ediliyor...')
+    const ytmOk = await ensureYtMusicApiInstalled()
+    log(ytmOk ? 'ytmusicapi hazır.' : 'ytmusicapi kurulamadı.')
+
+    const afterCheck = await (async () => {
+      const deps = {
+        'yt-dlp': canRunCommand('yt-dlp', ['--version']),
+        'ffmpeg': canRunCommand('ffmpeg', ['-version']),
+        python: canRunPython(),
+      }
+      let ytmusicapi = false
+      if (deps.python) {
+        ytmusicapi = await checkPythonPackage('ytmusicapi')
+      }
+      return {
+        available: deps,
+        ytmusicapi,
+        missing: Object.entries(deps)
+          .filter(([, available]) => !available)
+          .map(([name]) => name),
+        missingPython: deps.python ? (!ytmusicapi ? ['ytmusicapi'] : []) : [],
+      }
+    })()
+
+    return { ok: true, logs: installLogs, status: afterCheck }
+  } catch (error) {
+    return { ok: false, reason: String(error?.message || error || 'auto-install-failed'), logs: installLogs }
+  }
 })
 
 const sanitizeFileName = (value = '', fallback = 'track') => {
@@ -688,6 +2313,20 @@ const isLikelyAudioContentType = (value = '') => {
   if (normalized.includes('audio/')) return true
   if (normalized.includes('application/octet-stream')) return true
   if (normalized.includes('binary/octet-stream')) return true
+  return false
+}
+
+const isLikelyImageContentType = (value = '') => {
+  const normalized = String(value || '').toLowerCase()
+  if (!normalized) return false
+  if (normalized.includes('image/')) return true
+  if (normalized.includes('jpeg')) return true
+  if (normalized.includes('jpg')) return true
+  if (normalized.includes('png')) return true
+  if (normalized.includes('webp')) return true
+  if (normalized.includes('gif')) return true
+  if (normalized.includes('bmp')) return true
+  if (normalized.includes('avif')) return true
   return false
 }
 
@@ -797,7 +2436,7 @@ const getAvailableCookieBrowsers = () => {
 }
 
 const isMissingCookiesDbError = (message = '') =>
-  /could not find .*cookies database/i.test(String(message || ''))
+  /could not find .*cookies database|could not copy .*cookies database/i.test(String(message || ''))
 
 const isDpapiCookieError = (message = '') =>
   /failed to decrypt with dpapi/i.test(String(message || ''))
@@ -883,21 +2522,308 @@ const ensureUniqueFilePath = async (filePath) => {
   return path.join(dir, `${base}-${Date.now()}${ext}`)
 }
 
-const getBundledToolPath = (fileName = '') => {
-  const safeName = String(fileName || '').trim()
-  if (!safeName) {
-    return ''
+const commandExists = (command = '') => {
+  const name = String(command || '').trim()
+  if (!name) {
+    return false
+  }
+  try {
+    const probe = process.platform === 'win32' ? 'where' : 'which'
+    const result = spawnSync(probe, [name], { stdio: 'ignore' })
+    return result.status === 0
+  } catch {
+    return false
+  }
+}
+
+const getYtDlpCandidates = () => {
+  const candidates = []
+  if (process.platform === 'win32') {
+    if (commandExists('yt-dlp')) {
+      candidates.push({ command: 'yt-dlp', args: [], mode: 'binary' })
+    }
+    if (commandExists('py')) {
+      candidates.push({ command: 'py', args: [], mode: 'python' })
+    }
+    if (commandExists('python')) {
+      candidates.push({ command: 'python', args: [], mode: 'python' })
+    }
+    if (commandExists('python3')) {
+      candidates.push({ command: 'python3', args: [], mode: 'python' })
+    }
+  } else {
+    if (commandExists('yt-dlp')) {
+      candidates.push({ command: 'yt-dlp', args: [], mode: 'binary' })
+    }
+    if (commandExists('python3')) {
+      candidates.push({ command: 'python3', args: [], mode: 'python' })
+    }
+    if (commandExists('python')) {
+      candidates.push({ command: 'python', args: [], mode: 'python' })
+    }
+  }
+  return candidates
+}
+
+const getPythonCandidates = () => {
+  if (process.platform === 'win32') {
+    return ['py', 'python', 'python3']
+  }
+  return ['python3', 'python']
+}
+
+const runPythonCommand = async (command, args = [], options = {}) =>
+  new Promise((resolve) => {
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const child = spawn(command, args, {
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      ...options,
+    })
+    child.on('error', (error) => {
+      if (settled) return
+      settled = true
+      resolve({ ok: false, code: -1, stdout, stderr: String(error?.message || error || 'spawn-error') })
+    })
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk.toString()
+    })
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk.toString()
+    })
+    child.on('close', (code) => {
+      if (settled) return
+      settled = true
+      resolve({ ok: code === 0, code: Number(code || 0), stdout, stderr })
+    })
+  })
+
+let ytmusicApiInstallAttempted = false
+let pythonRuntimeInstallAttempted = false
+
+const ensurePythonRuntimeInstalled = async () => {
+  if (pythonRuntimeInstallAttempted || process.platform !== 'win32') {
+    return false
+  }
+  pythonRuntimeInstallAttempted = true
+  if (!commandExists('winget')) {
+    return false
+  }
+  const install = await runPythonCommand('winget', [
+    'install',
+    '--id',
+    'Python.Python.3.12',
+    '-e',
+    '--silent',
+    '--accept-package-agreements',
+    '--accept-source-agreements',
+  ])
+  if (!install.ok) {
+    return false
+  }
+  // winget may require a fresh shell, but often python becomes available immediately.
+  return commandExists('py') || commandExists('python') || commandExists('python3')
+}
+
+const ensureYtMusicApiInstalled = async () => {
+  if (ytmusicApiInstallAttempted) {
+    return false
+  }
+  ytmusicApiInstallAttempted = true
+  for (const command of getPythonCandidates()) {
+    if (!commandExists(command)) continue
+    const probe = await runPythonCommand(command, ['-c', 'import ytmusicapi; print("ok")'])
+    if (probe.ok && String(probe.stdout || '').toLowerCase().includes('ok')) {
+      return true
+    }
+    await runPythonCommand(command, ['-m', 'pip', 'install', '--user', 'ytmusicapi'])
+    const recheck = await runPythonCommand(command, ['-c', 'import ytmusicapi; print("ok")'])
+    if (recheck.ok && String(recheck.stdout || '').toLowerCase().includes('ok')) {
+      return true
+    }
+  }
+  return false
+}
+
+const runYtMusicApi = async (payload = {}) => {
+  // In production, the script is in resources/bin extracted from extraResources
+  // process.resourcesPath points to the 'resources' folder next to app.asar
+  let scriptPath = path.join(process.resourcesPath, 'bin', 'ytmusic_bridge.py')
+  if (!fs.existsSync(scriptPath)) {
+    // Fallback for development mode
+    scriptPath = path.join(__dirname, 'ytmusic_bridge.py')
+  }
+  if (!fs.existsSync(scriptPath)) {
+    return { ok: false, error: 'ytmusic-bridge-missing' }
   }
 
-  const packagedPath = path.join(process.resourcesPath, 'bin', safeName)
-  const devPath = path.join(path.resolve(__dirname, '..'), 'vendor', safeName)
-  if (fs.existsSync(packagedPath)) {
-    return packagedPath
+  let candidates = getPythonCandidates()
+  let lastError = ''
+  const hasAnyPython = candidates.some((command) => commandExists(command))
+  if (!hasAnyPython) {
+    return { ok: false, error: 'python-not-found' }
   }
-  if (fs.existsSync(devPath)) {
-    return devPath
+  let retriedAfterInstall = false
+  for (const command of candidates) {
+    if (!commandExists(command)) {
+      continue
+    }
+    try {
+      const result = await new Promise((resolve) => {
+        let stdout = ''
+        let stderr = ''
+        let settled = false
+        const child = spawn(command, [scriptPath], {
+          windowsHide: true,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: {
+            ...process.env,
+            PYTHONUTF8: '1',
+            PYTHONIOENCODING: 'utf-8',
+          },
+        })
+        child.on('error', (error) => {
+          if (settled) return
+          settled = true
+          resolve({ ok: false, error: String(error?.message || error || 'spawn-error') })
+        })
+        child.stdout?.on('data', (chunk) => {
+          stdout += chunk.toString()
+        })
+        child.stderr?.on('data', (chunk) => {
+          stderr += chunk.toString()
+        })
+        child.on('close', (code) => {
+          if (settled) return
+          settled = true
+          if (code !== 0) {
+            resolve({ ok: false, error: String(stderr || stdout || `exit-${code}`) })
+            return
+          }
+          resolve({ ok: true, stdout, stderr })
+        })
+        child.stdin?.write(JSON.stringify(payload || {}))
+        child.stdin?.end()
+      })
+      if (!result.ok) {
+        lastError = String(result.error || '')
+        const lowerError = lastError.toLowerCase()
+        const moduleMissing =
+          lowerError.includes('no module named') && lowerError.includes('ytmusicapi')
+        if (moduleMissing && !retriedAfterInstall) {
+          retriedAfterInstall = true
+          await runPythonCommand(command, ['-m', 'pip', 'install', '--user', 'ytmusicapi'])
+          const verify = await runPythonCommand(command, ['-c', 'import ytmusicapi; print("ok")'])
+          if (verify.ok && String(verify.stdout || '').toLowerCase().includes('ok')) {
+            const retryResult = await new Promise((resolve) => {
+              let stdout = ''
+              let stderr = ''
+              let settled = false
+              const child = spawn(command, [scriptPath], {
+                windowsHide: true,
+                stdio: ['pipe', 'pipe', 'pipe'],
+                env: {
+                  ...process.env,
+                  PYTHONUTF8: '1',
+                  PYTHONIOENCODING: 'utf-8',
+                },
+              })
+              child.on('error', (error) => {
+                if (settled) return
+                settled = true
+                resolve({ ok: false, error: String(error?.message || error || 'spawn-error') })
+              })
+              child.stdout?.on('data', (chunk) => {
+                stdout += chunk.toString()
+              })
+              child.stderr?.on('data', (chunk) => {
+                stderr += chunk.toString()
+              })
+              child.on('close', (code) => {
+                if (settled) return
+                settled = true
+                if (code !== 0) {
+                  resolve({ ok: false, error: String(stderr || stdout || `exit-${code}`) })
+                  return
+                }
+                resolve({ ok: true, stdout, stderr })
+              })
+              child.stdin?.write(JSON.stringify(payload || {}))
+              child.stdin?.end()
+            })
+            if (retryResult.ok) {
+              const parsed = JSON.parse(String(retryResult.stdout || '{}'))
+              return parsed
+            }
+            lastError = String(retryResult.error || lastError || '')
+          }
+        }
+        continue
+      }
+      const parsed = JSON.parse(String(result.stdout || '{}'))
+      const parsedError = String(parsed?.error || '').toLowerCase()
+      const parsedModuleMissing =
+        (parsed?.ok === false && parsedError.includes('ytmusicapi import failed')) ||
+        (parsed?.ok === false && parsedError.includes('no module named') && parsedError.includes('ytmusicapi'))
+
+      if (parsedModuleMissing && !retriedAfterInstall) {
+        retriedAfterInstall = true
+        await runPythonCommand(command, ['-m', 'pip', 'install', '--user', 'ytmusicapi'])
+        const verify = await runPythonCommand(command, ['-c', 'import ytmusicapi; print("ok")'])
+        if (verify.ok && String(verify.stdout || '').toLowerCase().includes('ok')) {
+          const retryResult = await new Promise((resolve) => {
+            let stdout = ''
+            let stderr = ''
+            let settled = false
+            const child = spawn(command, [scriptPath], {
+              windowsHide: true,
+              stdio: ['pipe', 'pipe', 'pipe'],
+              env: {
+                ...process.env,
+                PYTHONUTF8: '1',
+                PYTHONIOENCODING: 'utf-8',
+              },
+            })
+            child.on('error', (error) => {
+              if (settled) return
+              settled = true
+              resolve({ ok: false, error: String(error?.message || error || 'spawn-error') })
+            })
+            child.stdout?.on('data', (chunk) => {
+              stdout += chunk.toString()
+            })
+            child.stderr?.on('data', (chunk) => {
+              stderr += chunk.toString()
+            })
+            child.on('close', (code) => {
+              if (settled) return
+              settled = true
+              if (code !== 0) {
+                resolve({ ok: false, error: String(stderr || stdout || `exit-${code}`) })
+                return
+              }
+              resolve({ ok: true, stdout, stderr })
+            })
+            child.stdin?.write(JSON.stringify(payload || {}))
+            child.stdin?.end()
+          })
+
+          if (retryResult.ok) {
+            return JSON.parse(String(retryResult.stdout || '{}'))
+          }
+          lastError = String(retryResult.error || lastError || '')
+          continue
+        }
+      }
+
+      return parsed
+    } catch (error) {
+      lastError = String(error?.message || error || 'ytmusic-exec-error')
+    }
   }
-  return ''
+  return { ok: false, error: lastError || 'python-not-found' }
 }
 
 const downloadDirectUrlToLibrary = async ({ targetUrl, title = '', artist = '', fileName = '' }) => {
@@ -932,7 +2858,7 @@ const downloadDirectUrlToLibrary = async ({ targetUrl, title = '', artist = '', 
   return {
     ok: true,
     filePath,
-    fileUrl: pathToFileURL(filePath).href,
+    fileUrl: await toLocalMediaUrl(filePath),
     fileName: path.basename(filePath),
     contentType,
     extension,
@@ -955,16 +2881,7 @@ const runYtDlpDownload = async ({ targetUrl, title = '', artist = '', allowPlayl
     ? `${safeBase} - %(playlist_index|NA)s - %(title)s`
     : '%(playlist_title|Playlist)s - %(playlist_index|NA)s - %(title)s [%(id)s]'
 
-  const candidateCommands = []
-  const bundledYtDlpPath = getBundledToolPath('yt-dlp.exe')
-
-  if (bundledYtDlpPath) {
-    candidateCommands.push({
-      command: bundledYtDlpPath,
-      args: [],
-      mode: 'binary',
-    })
-  }
+  const candidateCommands = getYtDlpCandidates()
 
   if (!candidateCommands.length) {
     return {
@@ -1000,9 +2917,37 @@ const runYtDlpDownload = async ({ targetUrl, title = '', artist = '', allowPlayl
           queue.push(fullPath)
           continue
         }
-        if (/\.(mp3|wav|flac|m4a|aac|ogg)$/i.test(entry.name)) {
+        if (/\.(mp3|wav|flac|m4a|aac|ogg|webm|opus|mp4|mkv|m4b|weba)$/i.test(entry.name)) {
           files.push(fullPath)
         }
+      }
+    }
+    return files
+  }
+
+  const collectAnyDownloadedMedia = async (rootDir) => {
+    const files = []
+    const queue = [rootDir]
+    while (queue.length) {
+      const current = queue.shift()
+      const entries = await fs.promises.readdir(current, { withFileTypes: true })
+      for (const entry of entries) {
+        const fullPath = path.join(current, entry.name)
+        if (entry.isDirectory()) {
+          queue.push(fullPath)
+          continue
+        }
+        const lower = entry.name.toLowerCase()
+        if (
+          lower.endsWith('.info.json') ||
+          lower.endsWith('.description') ||
+          lower.endsWith('.part') ||
+          lower.endsWith('.ytdl') ||
+          lower.endsWith('.json')
+        ) {
+          continue
+        }
+        files.push(fullPath)
       }
     }
     return files
@@ -1012,6 +2957,21 @@ const runYtDlpDownload = async ({ targetUrl, title = '', artist = '', allowPlayl
   let usedAnyBundledBinary = false
   let sawCookieAccessProblem = false
   const youtubeTarget = isYouTubeUrl(targetUrl)
+  const getYouTubeThumbFromInfo = (info = {}) => {
+    const webpageUrl = String(info?.webpage_url || info?.original_url || '').trim()
+    const isMusicPage = /music\.youtube\.com/i.test(webpageUrl)
+    if (!isMusicPage) {
+      // Do not use regular YouTube video thumbnail as album cover.
+      return ''
+    }
+    const direct = String(info?.thumbnail || '').trim()
+    if (direct) return direct
+    const id = String(info?.id || '').trim()
+    if (id) return `https://i.ytimg.com/vi/${id}/hqdefault.jpg`
+    const match = webpageUrl.match(/[?&]v=([^&]+)/i) || webpageUrl.match(/youtu\.be\/([^?&/]+)/i)
+    if (match?.[1]) return `https://i.ytimg.com/vi/${match[1]}/hqdefault.jpg`
+    return ''
+  }
   for (const candidate of candidateCommands) {
     if (candidate.mode === 'binary') {
       usedAnyBundledBinary = true
@@ -1034,7 +2994,7 @@ const runYtDlpDownload = async ({ targetUrl, title = '', artist = '', allowPlayl
       '--ignore-errors',
       '--write-info-json',
       '--format',
-      'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+      'bestaudio/best',
       '--no-warnings',
       '--output',
       outputTemplate,
@@ -1045,14 +3005,20 @@ const runYtDlpDownload = async ({ targetUrl, title = '', artist = '', allowPlayl
     } else {
       commonArgs.unshift('--yes-playlist')
     }
+    // User-managed dependency model:
+    // ffmpeg path is not bundled/injected at runtime.
     // Avoid ffmpeg transcoding for lower disk usage during download.
     // We keep the original audio stream format (m4a/webm/other bestaudio).
 
-    const availableCookieBrowsers = youtubeTarget ? getAvailableCookieBrowsers() : []
+    const useBrowserCookies =
+      String(process.env.ENABLE_BROWSER_COOKIES || '').trim() === '1'
+    const availableCookieBrowsers =
+      youtubeTarget && useBrowserCookies ? getAvailableCookieBrowsers() : []
     const attemptVariants = youtubeTarget
       ? [
           { kind: 'no-cookie-default', args: [] },
           { kind: 'no-cookie-android', args: ['--extractor-args', 'youtube:player_client=android'] },
+          { kind: 'no-cookie-tv', args: ['--extractor-args', 'youtube:player_client=tv_embedded'] },
           ...availableCookieBrowsers.map((browser) => ({
             kind: 'browser-cookies',
             args: ['--cookies-from-browser', browser],
@@ -1145,10 +3111,59 @@ const runYtDlpDownload = async ({ targetUrl, title = '', artist = '', allowPlayl
         }
 
         if (!downloadedPaths.length) {
-          lastError = 'yt-dlp-path-missing'
-          await fs.promises.rm(jobDir, { recursive: true, force: true })
-          await ensureDirectory(jobDir)
-          continue
+          // Fallback 1: if any non-meta media exists, still accept it.
+          const anyMedia = await collectAnyDownloadedMedia(jobDir)
+          if (anyMedia.length) {
+            downloadedPaths.push(...anyMedia)
+          } else {
+            // Fallback 2: force audio extraction to mp3 for hard cases.
+            const fallbackArgs =
+              candidate.mode === 'python'
+                ? [...candidate.args, '-m', 'yt_dlp', ...attempt.args, '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0', ...commonArgs]
+                : [...candidate.args, ...attempt.args, '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0', ...commonArgs]
+
+            const fallbackResult = await new Promise((resolve) => {
+              let stdout = ''
+              let stderr = ''
+              let spawnFailed = false
+              const child = spawn(candidate.command, fallbackArgs, {
+                windowsHide: true,
+                stdio: ['ignore', 'pipe', 'pipe'],
+              })
+              child.on('error', (error) => {
+                spawnFailed = true
+                stderr = String(error?.message || error || 'spawn-error')
+              })
+              child.stdout?.on('data', (chunk) => {
+                stdout += chunk.toString()
+              })
+              child.stderr?.on('data', (chunk) => {
+                stderr += chunk.toString()
+              })
+              child.on('close', (code) => {
+                resolve({
+                  ok: !spawnFailed && code === 0,
+                  stdout,
+                  stderr,
+                })
+              })
+            })
+
+            const fallbackDownloaded = await collectAudioFiles(jobDir)
+            if (!fallbackDownloaded.length && !fallbackResult.ok) {
+              lastError = String(fallbackResult.stderr || fallbackResult.stdout || 'yt-dlp-path-missing')
+              await fs.promises.rm(jobDir, { recursive: true, force: true })
+              await ensureDirectory(jobDir)
+              continue
+            }
+            if (!fallbackDownloaded.length) {
+              lastError = 'yt-dlp-path-missing'
+              await fs.promises.rm(jobDir, { recursive: true, force: true })
+              await ensureDirectory(jobDir)
+              continue
+            }
+            downloadedPaths.push(...fallbackDownloaded)
+          }
         }
 
         const tracks = []
@@ -1190,14 +3205,16 @@ const runYtDlpDownload = async ({ targetUrl, title = '', artist = '', allowPlayl
             info?.playlist_title ||
             '',
           ).trim()
+          const normalizedCoverUrl = getYouTubeThumbFromInfo(info)
           tracks.push({
             filePath: finalPath,
-            fileUrl: pathToFileURL(finalPath).href,
+            fileUrl: await toLocalMediaUrl(finalPath),
             fileName: path.basename(finalPath),
             size: Number(stats.size || 0),
             title: normalizedTitle,
             artist: normalizedArtist,
             album: normalizedAlbum,
+            coverUrl: normalizedCoverUrl,
           })
         }
 
@@ -1233,80 +3250,122 @@ const runYtDlpDownload = async ({ targetUrl, title = '', artist = '', allowPlayl
   }
 }
 
-const runYtDlpSearch = async ({ query = '', limit = 10 }) => {
+const runYtDlpSearch = async ({ query = '', limit = 10, source = 'ytmusic' }) => {
   const searchQuery = String(query || '').trim()
   if (!searchQuery) {
     return { ok: false, reason: 'empty-query', items: [] }
   }
 
   const safeLimit = Math.max(1, Math.min(25, Number(limit || 10)))
-  const bundledYtDlpPath = getBundledToolPath('yt-dlp.exe')
-  if (!bundledYtDlpPath) {
+  const candidateCommands = getYtDlpCandidates()
+  if (!candidateCommands.length) {
     return { ok: false, reason: 'yt-dlp-binary-missing', items: [] }
   }
 
+  const effectiveSource = String(source || 'ytmusic').toLowerCase() === 'youtube' ? 'youtube' : 'ytmusic'
+  // Keep yt-dlp compatible search prefix; YT Music behavior is controlled via extractor args.
+  const searchPrefix = 'ytsearch'
   const args = [
     '--flat-playlist',
     '--dump-single-json',
     '--no-warnings',
+    '--extractor-args',
+    effectiveSource === 'ytmusic'
+      ? 'youtube:player_client=web_music'
+      : 'youtube:player_client=web',
     '--playlist-end',
     String(safeLimit),
-    `ytsearch${safeLimit}:${searchQuery}`,
+    `${searchPrefix}${safeLimit}:${searchQuery}`,
   ]
 
   try {
-    const result = await new Promise((resolve) => {
-      let stdout = ''
-      let stderr = ''
-      let spawnFailed = false
-      const child = spawn(bundledYtDlpPath, args, {
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      child.on('error', (error) => {
-        spawnFailed = true
-        stderr = String(error?.message || error || 'spawn-error')
-      })
-      child.stdout?.on('data', (chunk) => {
-        stdout += chunk.toString()
-      })
-      child.stderr?.on('data', (chunk) => {
-        stderr += chunk.toString()
-      })
-      child.on('close', (code) => {
-        resolve({
-          ok: !spawnFailed && code === 0,
-          stdout,
-          stderr,
+    let parsed = null
+    let lastSearchError = ''
+    for (const candidate of candidateCommands) {
+      const fullArgs =
+        candidate.mode === 'python'
+          ? [...candidate.args, '-m', 'yt_dlp', ...args]
+          : [...candidate.args, ...args]
+
+      const result = await new Promise((resolve) => {
+        let stdout = ''
+        let stderr = ''
+        let spawnFailed = false
+        const child = spawn(candidate.command, fullArgs, {
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        child.on('error', (error) => {
+          spawnFailed = true
+          stderr = String(error?.message || error || 'spawn-error')
+        })
+        child.stdout?.on('data', (chunk) => {
+          stdout += chunk.toString()
+        })
+        child.stderr?.on('data', (chunk) => {
+          stderr += chunk.toString()
+        })
+        child.on('close', (code) => {
+          resolve({
+            ok: !spawnFailed && code === 0,
+            stdout,
+            stderr,
+          })
         })
       })
-    })
 
-    if (!result.ok) {
+      if (!result.ok) {
+        lastSearchError = String(result.stderr || result.stdout || '').trim()
+        continue
+      }
+
+      parsed = JSON.parse(String(result.stdout || '{}'))
+      break
+    }
+
+    if (!parsed) {
       return {
         ok: false,
         reason: 'yt-dlp-search-failed',
-        error: String(result.stderr || result.stdout || '').trim(),
+        error: lastSearchError || 'yt-dlp search failed',
         items: [],
       }
     }
 
-    const parsed = JSON.parse(String(result.stdout || '{}'))
     const entries = Array.isArray(parsed?.entries) ? parsed.entries : []
+    const buildYoutubeThumb = (id = '', preferred = 'hqdefault') => {
+      const cleanId = String(id || '').trim()
+      if (!cleanId) {
+        return ''
+      }
+      return `https://i.ytimg.com/vi/${cleanId}/${preferred}.jpg`
+    }
+    const blockedTitle = /\b(slowed|sped\s*up|nightcore|karaoke|8d|bass\s*boosted|live|concert|reaction)\b/i
     const items = entries
       .map((entry) => {
         const id = String(entry?.id || '').trim()
         if (!id) {
           return null
         }
+        const title = String(entry?.title || '').trim()
+        if (!title || blockedTitle.test(title)) {
+          return null
+        }
         const duration = Number(entry?.duration || 0)
         return {
           id,
-          title: String(entry?.title || '').trim(),
+          title,
           artist: String(entry?.uploader || entry?.channel || '').trim(),
           duration: Number.isFinite(duration) && duration > 0 ? duration : 0,
-          url: `https://www.youtube.com/watch?v=${id}`,
-          thumbnail: String(entry?.thumbnail || '').trim(),
+          url:
+            effectiveSource === 'ytmusic'
+              ? `https://music.youtube.com/watch?v=${id}`
+              : `https://www.youtube.com/watch?v=${id}`,
+          thumbnail:
+            String(entry?.thumbnail || '').trim() ||
+            buildYoutubeThumb(id, 'hqdefault') ||
+            buildYoutubeThumb(id, 'mqdefault'),
+          source: effectiveSource,
         }
       })
       .filter(Boolean)
@@ -1322,6 +3381,163 @@ const runYtDlpSearch = async ({ query = '', limit = 10 }) => {
   }
 }
 
+const fetchJsonSafe = async (url, fallback = null) => {
+  try {
+    const response = await fetch(url)
+    if (!response.ok) return fallback
+    return await response.json()
+  } catch {
+    return fallback
+  }
+}
+
+const normalizeText = (value = '') =>
+  String(value || '')
+    .toLocaleLowerCase('tr-TR')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+const artistNameMatches = (left = '', right = '') => {
+  const l = normalizeText(left)
+  const r = normalizeText(right)
+  if (!l || !r) return false
+  return l === r || l.includes(r) || r.includes(l)
+}
+
+const classifyAlbumKind = (albumName = '', trackCount = 0) => {
+  const normalized = normalizeText(albumName)
+  if (/\b(single|ep)\b/.test(normalized)) return 'single'
+  if (Number(trackCount || 0) > 0 && Number(trackCount || 0) <= 3) return 'single'
+  return 'album'
+}
+
+const getArtistCatalogFromItunes = async (artistName = '') => {
+  const query = String(artistName || '').trim()
+  if (!query) return { ok: true, albums: [], singles: [], topSongs: [] }
+
+  const artistSearchUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=musicArtist&limit=8`
+  const artistSearchJson = await fetchJsonSafe(artistSearchUrl, { results: [] })
+  const artistCandidates = Array.isArray(artistSearchJson?.results) ? artistSearchJson.results : []
+  const selectedArtist =
+    artistCandidates.find((item) => artistNameMatches(item?.artistName || '', query)) || artistCandidates[0] || null
+  if (!selectedArtist?.artistId) {
+    return { ok: true, albums: [], singles: [], topSongs: [] }
+  }
+
+  const artistId = Number(selectedArtist.artistId)
+  const lookupUrl = `https://itunes.apple.com/lookup?id=${artistId}&entity=album&limit=250`
+  const lookupJson = await fetchJsonSafe(lookupUrl, { results: [] })
+  const rows = Array.isArray(lookupJson?.results) ? lookupJson.results : []
+
+  const albumMap = new Map()
+  const topSongs = []
+
+  for (const row of rows) {
+    const wrapper = String(row?.wrapperType || '')
+    if (wrapper === 'track' && String(row?.kind || '') === 'song') {
+      const trackName = String(row?.trackName || '').trim()
+      const trackArtist = String(row?.artistName || selectedArtist.artistName || query).trim()
+      if (trackName && topSongs.length < 25) {
+        topSongs.push({
+          id: `it-track-${row?.trackId || `${trackArtist}-${trackName}`}`,
+          title: trackName,
+          artist: trackArtist,
+          duration: Math.round(Number(row?.trackTimeMillis || 0) / 1000) || 0,
+          url: '',
+          thumbnail: String(row?.artworkUrl100 || '').replace('100x100bb', '512x512bb'),
+          album: String(row?.collectionName || '').trim(),
+        })
+      }
+      continue
+    }
+
+    if (wrapper !== 'collection' || String(row?.collectionType || '') !== 'Album') continue
+    const rowArtist = String(row?.artistName || '').trim()
+    if (!artistNameMatches(rowArtist, query)) continue
+
+    const collectionId = Number(row?.collectionId || 0)
+    const title = String(row?.collectionName || '').trim()
+    if (!collectionId || !title) continue
+
+    const key = String(collectionId)
+    if (albumMap.has(key)) continue
+
+    albumMap.set(key, {
+      id: `it:${collectionId}`,
+      title,
+      coverUrl: String(row?.artworkUrl100 || '').replace('100x100bb', '512x512bb'),
+      artist: rowArtist || query,
+      trackCount: Number(row?.trackCount || 0) || 0,
+      releaseDate: String(row?.releaseDate || '').trim(),
+      kind: classifyAlbumKind(title, Number(row?.trackCount || 0)),
+    })
+  }
+
+  const releases = Array.from(albumMap.values()).sort((a, b) => {
+    const da = Date.parse(a.releaseDate || '') || 0
+    const db = Date.parse(b.releaseDate || '') || 0
+    return db - da
+  })
+
+  const albums = releases.filter((item) => item.kind === 'album')
+  const singles = releases.filter((item) => item.kind === 'single')
+
+  return { ok: true, albums, singles, topSongs }
+}
+
+const getAlbumTracksFromItunes = async (albumId = '', fallbackArtist = '') => {
+  const normalized = String(albumId || '').trim()
+  const match = normalized.match(/^it:(\d+)$/)
+  if (!match) return { ok: false, tracks: [] }
+
+  const lookupUrl = `https://itunes.apple.com/lookup?id=${encodeURIComponent(match[1])}&entity=song`
+  const lookupJson = await fetchJsonSafe(lookupUrl, { results: [] })
+  const rows = Array.isArray(lookupJson?.results) ? lookupJson.results : []
+  const tracks = []
+  for (const row of rows) {
+    if (String(row?.wrapperType || '') !== 'track' || String(row?.kind || '') !== 'song') continue
+    const title = String(row?.trackName || '').trim()
+    const artist = String(row?.artistName || fallbackArtist || '').trim()
+    if (!title) continue
+    tracks.push({
+      id: `it-song-${row?.trackId || `${artist}-${title}`}`,
+      title,
+      artist,
+      duration: Math.round(Number(row?.trackTimeMillis || 0) / 1000) || 0,
+      url: '',
+      thumbnail: String(row?.artworkUrl100 || '').replace('100x100bb', '512x512bb'),
+      album: String(row?.collectionName || '').trim(),
+    })
+  }
+
+  // Fill playable links from YT Music search (limited parallelism for speed and stability).
+  const concurrency = 4
+  for (let i = 0; i < tracks.length; i += concurrency) {
+    const chunk = tracks.slice(i, i + concurrency)
+    await Promise.all(
+      chunk.map(async (track) => {
+        const result = await runYtDlpSearch({
+          query: `${track.artist} ${track.title}`.trim(),
+          limit: 1,
+          source: 'ytmusic',
+        })
+        const first = Array.isArray(result?.items) ? result.items[0] : null
+        if (first?.url) {
+          track.url = String(first.url)
+          if (!track.thumbnail && first.thumbnail) {
+            track.thumbnail = String(first.thumbnail)
+          }
+        }
+      }),
+    )
+  }
+
+  return { ok: true, tracks }
+}
+
 
 ipcMain.handle('library:export', async (_, payload) => {
   if (!mainWindow || mainWindow.isDestroyed()) {
@@ -1335,12 +3551,12 @@ ipcMain.handle('library:export', async (_, payload) => {
 
   const confirm = await dialog.showMessageBox(mainWindow, {
     type: 'question',
-    buttons: ['Ä°ptal', 'Devam et'],
+    buttons: ['Cancel', 'Continue'],
     defaultId: 1,
     cancelId: 0,
-    title: 'DÄ±ÅŸa aktar',
-    message: 'MÃ¼zikler ve kapaklar dÄ±ÅŸa aktarÄ±lsÄ±n mÄ±?',
-    detail: `${tracks.length} parÃ§a seÃ§ildi. KlasÃ¶r seÃ§tikten sonra dosyalar kaydedilecek.`,
+    title: 'Export',
+    message: 'Export music and covers?',
+    detail: `${tracks.length} tracks selected. Files will be saved after you choose a folder.`,
     noLink: true,
   })
 
@@ -1349,7 +3565,7 @@ ipcMain.handle('library:export', async (_, payload) => {
   }
 
   const pick = await dialog.showOpenDialog(mainWindow, {
-    title: 'Kaydetme klasÃ¶rÃ¼ seÃ§',
+    title: 'Choose save folder',
     properties: ['openDirectory', 'createDirectory'],
   })
 
@@ -1359,7 +3575,7 @@ ipcMain.handle('library:export', async (_, payload) => {
 
   const baseDir = pick.filePaths[0]
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-  const exportRoot = path.join(baseDir, `Ghxsty-Music-Export-${stamp}`)
+  const exportRoot = path.join(baseDir, `GLITCH-Music-Export-${stamp}`)
   const audioDir = path.join(exportRoot, 'audio')
   const coverDir = path.join(exportRoot, 'covers')
   await ensureDirectory(audioDir)
@@ -1367,7 +3583,7 @@ ipcMain.handle('library:export', async (_, payload) => {
 
   const manifest = {
     exportedAt: new Date().toISOString(),
-    app: 'Music',
+    app: 'GLITCH Music',
     tracks: [],
   }
 
@@ -1478,7 +3694,7 @@ ipcMain.on('presence:update', (_, presence) => {
   }
 
   const title = String(presence.track.title || '').trim() || 'Bilinmeyen Sarki'
-  const artist = String(presence.track.artist || '').trim() || 'Music'
+  const artist = String(presence.track.artist || '').trim() || 'GLITCH Music'
   const collection = String(presence.track.collection || '').trim() || 'Muzik'
   const album = String(presence.track.album || '').trim()
   const coverUrl = String(presence.track.coverUrl || '').trim()
@@ -1486,43 +3702,104 @@ ipcMain.on('presence:update', (_, presence) => {
   const currentProgress = Math.max(0, Number(presence.progress || 0) || 0)
   const clampedProgress = duration > 0 ? Math.min(currentProgress, duration) : currentProgress
 
-  const startTimestamp = presence.isPlaying ? new Date(Date.now() - clampedProgress * 1000) : undefined
-  const endTimestamp = presence.isPlaying && duration && startTimestamp
-    ? new Date(startTimestamp.getTime() + duration * 1000)
-    : undefined
-
-  const youtubeSearch = `https://www.youtube.com/results?search_query=${encodeURIComponent(`${artist} ${title}`.trim())}`
   const progressLabel = duration > 0
     ? `${formatPresenceTime(clampedProgress)} / ${formatPresenceTime(duration)}`
     : 'Canli'
   const sourceLabel = album || collection
-  const stateText = `${artist} • ${progressLabel}`
+  const stateText = `by ${artist}`
+  const now = Date.now()
+  const safeDuration = Math.max(0, Number(duration || 0) || 0)
+  const safeProgress = Math.max(0, Math.min(Number(clampedProgress || 0) || 0, safeDuration || Number(clampedProgress || 0) || 0))
+  const startMs = now - Math.floor(safeProgress * 1000)
+  const endMs = safeDuration > 0 ? startMs + Math.floor(safeDuration * 1000) : 0
+  
+  // Normalize cover URL and format for Discord Media Proxy
+  const normalizedCoverUrl = /^https?:\/\//i.test(coverUrl) ? coverUrl : ''
+  
+  // Discord RPC can handle external media via mp:// protocol
+  // Format: mp://external/{base64-encoded-url} or direct HTTPS for certain domains
+  const getDiscordMediaKey = (url) => {
+    if (!url) return ''
+    // Try direct URL first (works for some image hosts)
+    if (/^https:\/\/(i\.ytimg\.com|lh3\.googleusercontent\.com|images\.genius\.com|image\.genius\.com|media\.spotify\.com)/i.test(url)) {
+      return url // These domains often work directly
+    }
+    // Fallback to mp:// protocol for other URLs
+    try {
+      const encoded = Buffer.from(url).toString('base64')
+      return `mp://external/${encoded}`
+    } catch {
+      return ''
+    }
+  }
+  
+  const mediaKey = normalizedCoverUrl ? getDiscordMediaKey(normalizedCoverUrl) : ''
+  
   const baseActivity = {
+    name: 'GLITCH Music',
+    type: 2, // LISTENING
     details: title,
     state: stateText,
-    ...(startTimestamp ? { startTimestamp } : {}),
-    ...(endTimestamp ? { endTimestamp } : {}),
+    ...(presence.isPlaying && safeDuration > 0 ? { startTimestamp: new Date(startMs), endTimestamp: new Date(endMs) } : {}),
     largeImageText: `${artist} • ${sourceLabel}`,
     smallImageKey: discordSmallImageKey,
     smallImageText: presence.isPlaying ? `Caliyor • ${progressLabel}` : `Duraklatildi • ${progressLabel}`,
-    buttons: [{ label: "YouTube'da ara", url: youtubeSearch }],
+    buttons: [{ label: 'GLITCH Music', url: 'https://github.com/ghxsty-dev/glitch-music' }],
     instance: false,
   }
 
-  // Try cover URL first; if Discord rejects it, gracefully fallback to static app asset.
-  const activityWithCover = coverUrl
-    ? { ...baseActivity, largeImageKey: coverUrl }
-    : { ...baseActivity, largeImageKey: discordLargeImageKey }
+  const coverActivityCandidates = [
+    mediaKey ? { ...baseActivity, largeImageKey: mediaKey } : null,
+    { ...baseActivity, largeImageKey: discordLargeImageKey },
+    baseActivity,
+  ].filter(Boolean)
 
-  rpcClient
-    .setActivity(activityWithCover)
-    .catch(() =>
-      rpcClient.setActivity({
-        ...baseActivity,
-        largeImageKey: discordLargeImageKey,
-      }),
-    )
-    .catch(() => {})
+  const setRpcActivityRaw = async (activity) => {
+    if (!rpcClient) {
+      throw new Error('rpc-client-missing')
+    }
+    const rawActivity = {
+      name: String(activity?.name || 'GLITCH Music'),
+      type: Number(activity?.type || 2),
+      details: activity?.details,
+      state: activity?.state,
+      instance: Boolean(activity?.instance),
+      buttons: Array.isArray(activity?.buttons) ? activity.buttons : undefined,
+      assets: {
+        large_image: activity?.largeImageKey,
+        large_text: activity?.largeImageText,
+        small_image: activity?.smallImageKey,
+        small_text: activity?.smallImageText,
+      },
+      timestamps:
+        activity?.startTimestamp || activity?.endTimestamp
+          ? {
+              start: activity?.startTimestamp
+                ? Math.floor(new Date(activity.startTimestamp).getTime() / 1000)
+                : undefined,
+              end: activity?.endTimestamp
+                ? Math.floor(new Date(activity.endTimestamp).getTime() / 1000)
+                : undefined,
+            }
+          : undefined,
+    }
+    
+    if (typeof rpcClient.request === 'function') {
+      await rpcClient.request('SET_ACTIVITY', {
+        pid: process.pid,
+        activity: rawActivity,
+      })
+      return
+    }
+    await rpcClient.setActivity(activity)
+  }
+
+  const [firstCandidate, ...fallbackCandidates] = coverActivityCandidates
+  let chain = setRpcActivityRaw(firstCandidate)
+  for (const activity of fallbackCandidates) {
+    chain = chain.catch(() => setRpcActivityRaw(activity))
+  }
+  chain.catch(() => {})
 })
 
 ipcMain.on('settings:update', async (_, settings) => {
@@ -1572,6 +3849,15 @@ ipcMain.on('settings:update', async (_, settings) => {
       preventSleepWhilePlayingEnabled,
     })
     syncPlaybackPowerSaveBlocker()
+  }
+
+  if (typeof settings?.launchOnStartupEnabled === 'boolean') {
+    launchOnStartupEnabled = settings.launchOnStartupEnabled
+    writeRuntimePrefs({
+      ...readRuntimePrefs(),
+      launchOnStartupEnabled,
+    })
+    syncLaunchOnStartupSetting()
   }
 
   if (typeof settings?.hardwareAccelerationEnabled === 'boolean') {
@@ -1641,6 +3927,61 @@ ipcMain.handle('library:download-remote', async (_, payload) => {
       return { ok: false, reason: 'drive-confirm-required' }
     }
     return { ok: false, reason: 'network-error' }
+  }
+})
+
+ipcMain.handle('library:download-cover-to-library', async (_, payload) => {
+  const targetUrl = String(payload?.url || '').trim()
+  if (!targetUrl) {
+    return { ok: false, reason: 'missing-url' }
+  }
+
+  try {
+    const response = await fetchWithGoogleDriveFallback(targetUrl)
+    if (!response.ok) {
+      return { ok: false, reason: 'http-error', status: response.status }
+    }
+
+    const contentType = response.headers.get('content-type') || ''
+    if (!isLikelyImageContentType(contentType)) {
+      return { ok: false, reason: 'invalid-content-type', contentType }
+    }
+
+    const data = Buffer.from(await response.arrayBuffer())
+    if (!data.length) {
+      return { ok: false, reason: 'empty-data' }
+    }
+
+    const inputName = String(payload?.fileName || '').trim()
+    const safeBase = sanitizeFileName(path.basename(inputName, path.extname(inputName)) || 'cover')
+    const extByName = inputName ? getExtensionFromName(inputName, '') : ''
+    const extension =
+      extByName ||
+      getExtensionFromUrl(targetUrl, '') ||
+      getExtensionFromContentType(contentType, '.jpg')
+
+    const coverDir = path.join(app.getPath('userData'), 'library-covers')
+    await ensureDirectory(coverDir)
+    const initialPath = path.join(
+      coverDir,
+      `${safeBase}${extension.startsWith('.') ? extension : `.${extension}`}`,
+    )
+    const filePath = await ensureUniqueFilePath(initialPath)
+    await fs.promises.writeFile(filePath, data)
+
+    return {
+      ok: true,
+      filePath,
+      fileUrl: await toLocalMediaUrl(filePath),
+      contentType,
+      extension,
+      size: data.length || 0,
+    }
+  } catch (error) {
+    if (error?.code === 'drive-confirm-required') {
+      return { ok: false, reason: 'drive-confirm-required' }
+    }
+    return { ok: false, reason: String(error?.message || error || 'download-cover-failed') }
   }
 })
 
@@ -1768,7 +4109,7 @@ ipcMain.handle('library:download-remote-to-library', async (_, payload) => {
     return {
       ok: true,
       filePath,
-      fileUrl: pathToFileURL(filePath).href,
+      fileUrl: await toLocalMediaUrl(filePath),
       contentType,
       extension,
       size: data.length || 0,
@@ -1931,6 +4272,7 @@ ipcMain.handle('library:download-link-to-library', async (_, payload) => {
         title: String(track.title || ''),
         artist: String(track.artist || ''),
         album: String(track.album || ''),
+        coverUrl: String(track.coverUrl || ''),
       })),
       filePath: String(firstTrack?.filePath || ''),
       fileUrl: String(firstTrack?.fileUrl || ''),
@@ -1950,7 +4292,317 @@ ipcMain.handle('library:download-link-to-library', async (_, payload) => {
 ipcMain.handle('library:search-youtube', async (_, payload) => {
   const query = String(payload?.query || '').trim()
   const limit = Number(payload?.limit || 10)
-  return runYtDlpSearch({ query, limit })
+  return runYtDlpSearch({ query, limit, source: 'ytmusic' })
+})
+
+ipcMain.handle('library:search-ytmusic', async (_, payload) => {
+  const query = String(payload?.query || '').trim()
+  const limit = Number(payload?.limit || 12)
+  const filter = String(payload?.filter || 'all').trim().toLowerCase()
+  return runYtMusicApi({ action: 'search', query, limit, filter })
+})
+
+ipcMain.handle('library:artist-ytmusic-albums', async (_, payload) => {
+  const artistName = String(payload?.artistName || '').trim()
+  const ytmResult = await runYtMusicApi({ action: 'artist_albums', artistName })
+  const hasYtmData =
+    Boolean(Array.isArray(ytmResult?.albums) && ytmResult.albums.length) ||
+    Boolean(Array.isArray(ytmResult?.singles) && ytmResult.singles.length) ||
+    Boolean(Array.isArray(ytmResult?.topSongs) && ytmResult.topSongs.length)
+
+  if (ytmResult?.ok && hasYtmData) {
+    return ytmResult
+  }
+
+  const fallback = await getArtistCatalogFromItunes(artistName)
+  if (!fallback?.ok) {
+    return ytmResult
+  }
+
+  const mapRelease = (rows = []) =>
+    (Array.isArray(rows) ? rows : [])
+      .map((row) => ({
+        id: String(row?.id || '').trim(),
+        title: String(row?.title || '').trim(),
+        coverUrl: String(row?.coverUrl || '').trim(),
+        artist: String(row?.artist || artistName || '').trim(),
+        trackCount: Number(row?.trackCount || 0) || 0,
+      }))
+      .filter((row) => row.id && row.title)
+
+  const mapTopSong = (rows = []) =>
+    (Array.isArray(rows) ? rows : [])
+      .map((row) => ({
+        id: String(row?.id || '').trim(),
+        title: String(row?.title || '').trim(),
+        artist: String(row?.artist || artistName || '').trim(),
+        duration: Number(row?.duration || 0) || 0,
+        url: String(row?.url || '').trim(),
+        thumbnail: String(row?.thumbnail || '').trim(),
+        album: String(row?.album || '').trim(),
+      }))
+      .filter((row) => row.id && row.title)
+
+  return {
+    ok: true,
+    albums: mapRelease(fallback.albums),
+    singles: mapRelease(fallback.singles),
+    topSongs: mapTopSong(fallback.topSongs),
+    source: 'itunes-fallback',
+  }
+})
+
+ipcMain.handle('library:ytmusic-album-tracks', async (_, payload) => {
+  const albumId = String(payload?.albumId || '').trim()
+  return runYtMusicApi({ action: 'album_tracks', albumId })
+})
+
+ipcMain.handle('library:ytmusic-mood-playlists', async () => {
+  return runYtMusicApi({ action: 'mood_playlists' })
+})
+
+ipcMain.handle('library:ytmusic-similar-playlists', async (_, payload) => {
+  const artists = Array.isArray(payload?.artists) ? payload.artists.map((item) => String(item || '').trim()).filter(Boolean) : []
+  return runYtMusicApi({ action: 'similar_playlists', artists })
+})
+
+ipcMain.handle('library:ytmusic-latest-release', async (_, payload) => {
+  const artists = Array.isArray(payload?.artists) ? payload.artists.map((item) => String(item || '').trim()).filter(Boolean) : []
+  return runYtMusicApi({ action: 'latest_release_for_artists', artists })
+})
+
+ipcMain.handle('library:ytmusic-random-missing-song', async (_, payload) => {
+  const artists = Array.isArray(payload?.artists) ? payload.artists.map((item) => String(item || '').trim()).filter(Boolean) : []
+  const ownedSignatures = Array.isArray(payload?.ownedSignatures)
+    ? payload.ownedSignatures.map((item) => String(item || '').trim()).filter(Boolean)
+    : []
+  const seed = String(payload?.seed || '').trim()
+  return runYtMusicApi({ action: 'random_missing_song_for_artists', artists, ownedSignatures, seed })
+})
+
+ipcMain.handle('library:ytmusic-playlist-tracks', async (_, payload) => {
+  const playlistId = String(payload?.playlistId || '').trim()
+  return runYtMusicApi({ action: 'playlist_tracks', playlistId })
+})
+
+ipcMain.handle('library:fetch-remote-json', async (_, payload) => {
+  const rawUrl = String(payload?.url || '').trim()
+  if (!rawUrl) {
+    return { ok: false, reason: 'missing-url' }
+  }
+  try {
+    const response = await fetch(normalizeDriveUrl(rawUrl), { cache: 'no-store' })
+    if (!response.ok) {
+      return { ok: false, reason: `http_${response.status}` }
+    }
+    const json = await response.json()
+    return { ok: true, json }
+  } catch (error) {
+    return { ok: false, reason: String(error?.message || error || 'fetch-failed') }
+  }
+})
+
+ipcMain.handle('youtube:auth-status', async () => {
+  return getYoutubeAuthStatus()
+})
+
+ipcMain.handle('youtube:connect', async (_, payload) => {
+  try {
+    const cid = String(payload?.clientId || '')
+    const csec = String(payload?.clientSecret || '')
+    console.log('[YouTube OAuth] ipc payload lengths:', {
+      hasPayload: Boolean(payload),
+      clientIdLength: cid.length,
+      clientSecretLength: csec.length,
+      clientIdPreview: cid ? `${cid.slice(0, 8)}...` : '',
+    })
+  } catch {
+    // ignore payload logging issues
+  }
+  return connectYoutubeAccount(payload || {})
+})
+
+ipcMain.handle('youtube:disconnect', async () => {
+  clearYoutubeAuthState()
+  return { ok: true, connected: false }
+})
+
+ipcMain.handle('youtube:list-playlists', async () => {
+  return listYoutubePlaylists()
+})
+
+ipcMain.handle('youtube:list-playlist-tracks', async (_, payload) => {
+  return listYoutubePlaylistTracks(payload?.playlistId)
+})
+
+ipcMain.handle('spotify:auth-status', async () => {
+  return getSpotifyAuthStatus()
+})
+
+ipcMain.handle('spotify:connect', async () => {
+  return connectSpotifyAccount()
+})
+
+ipcMain.handle('spotify:disconnect', async () => {
+  clearSpotifyAuthState()
+  return { ok: true }
+})
+
+ipcMain.handle('spotify:list-playlists', async () => {
+  return listSpotifyPlaylists()
+})
+
+ipcMain.handle('spotify:list-playlist-tracks', async (_, payload) => {
+  return listSpotifyPlaylistTracks(payload?.playlistId)
+})
+
+ipcMain.handle('lyrics:fetch-lrclib', async (_, payload) => {
+  const artist = String(payload?.artist || '').trim()
+  const title = String(payload?.title || '').trim()
+  if (!artist || !title) {
+    return { ok: false, lyrics: '', reason: 'missing-artist-or-title' }
+  }
+
+  const extractLyrics = (item) => {
+    if (!item || typeof item !== 'object') return ''
+    const synced = String(item.syncedLyrics || '').trim()
+    if (synced) return synced
+    return String(item.plainLyrics || '').trim()
+  }
+
+  try {
+    const getUrl = `https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(title)}`
+    const getRes = await fetch(getUrl, { headers: { Accept: 'application/json' } })
+    if (getRes.ok) {
+      const json = await getRes.json()
+      const lyrics = extractLyrics(json)
+      if (lyrics) return { ok: true, lyrics, source: 'get' }
+    }
+  } catch {
+    // fallback below
+  }
+
+  try {
+    const searchUrl = `https://lrclib.net/api/search?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(title)}`
+    const searchRes = await fetch(searchUrl, { headers: { Accept: 'application/json' } })
+    if (searchRes.ok) {
+      const json = await searchRes.json()
+      if (Array.isArray(json)) {
+        for (const item of json) {
+          const lyrics = extractLyrics(item)
+          if (lyrics) return { ok: true, lyrics, source: 'search' }
+        }
+      }
+    }
+  } catch {
+    // no-op
+  }
+
+  return { ok: false, lyrics: '', reason: 'not-found' }
+})
+
+ipcMain.handle('lyrics:fetch-aggregate', async (_, payload) => {
+  const artist = String(payload?.artist || '').trim()
+  const title = String(payload?.title || '').trim()
+  if (!artist || !title) {
+    return { ok: false, lyrics: '', reason: 'missing-artist-or-title' }
+  }
+
+  const fetchWithTimeout = async (url, timeoutMs = 2000, options = {}) => {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const res = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          'user-agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari',
+          accept: 'application/json,text/plain,*/*',
+          ...(options.headers || {}),
+        },
+        cache: 'no-store',
+      })
+      clearTimeout(timeoutId)
+      if (!res.ok) throw new Error(`http_${res.status}`)
+      return res
+    } catch (error) {
+      clearTimeout(timeoutId)
+      throw error
+    }
+  }
+
+  // Parallel fetch with Promise.race to guarantee timeout
+  const fetchAny = async (promises) => {
+    return Promise.race([
+      Promise.any(promises),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('all-sources-timeout')), 9000)
+      ),
+    ])
+  }
+
+  // Lyrics.ovh
+  const ovhPromise = (async () => {
+    try {
+      const ovhUrl = `https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(title)}`
+      const res = await fetchWithTimeout(ovhUrl, 1800)
+      const json = await res.json()
+      const lyrics = String(json?.lyrics || '').trim()
+      if (lyrics) return { ok: true, lyrics, source: 'ovh' }
+    } catch {}
+    return null
+  })()
+
+  // Make It Personal
+  const mipPromise = (async () => {
+    try {
+      const mipUrl = `https://makeitpersonal.co/lyrics?artist=${encodeURIComponent(artist)}&title=${encodeURIComponent(title)}`
+      const res = await fetchWithTimeout(
+        mipUrl,
+        1800,
+        { headers: { accept: 'text/plain,*/*' } }
+      )
+      const text = String(await res.text()).trim()
+      if (text && !/sorry|not found|rate limit/i.test(text)) {
+        return { ok: true, lyrics: text, source: 'makeitpersonal' }
+      }
+    } catch {}
+    return null
+  })()
+
+  // Popcat
+  const popcatPromise = (async () => {
+    try {
+      const query = `${artist} ${title}`.trim()
+      const popUrl = `https://api.popcat.xyz/lyrics?song=${encodeURIComponent(query)}`
+      const res = await fetchWithTimeout(popUrl, 1800)
+      const json = await res.json()
+      const lyrics = String(json?.lyrics || '').trim()
+      if (lyrics) return { ok: true, lyrics, source: 'popcat' }
+    } catch {}
+    return null
+  })()
+
+  try {
+    const result = await Promise.race([
+      (async () => {
+        const r1 = await ovhPromise
+        if (r1?.ok) return r1
+        const r2 = await mipPromise
+        if (r2?.ok) return r2
+        const r3 = await popcatPromise
+        if (r3?.ok) return r3
+        return null
+      })(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('total-timeout')), 7000)
+      ),
+    ])
+    if (result?.ok) return result
+  } catch {}
+
+  return { ok: false, lyrics: '', reason: 'not-found' }
 })
 
 ipcMain.handle('library:resolve-local-track-urls', async (_, payload) => {
@@ -1971,8 +4623,18 @@ ipcMain.handle('library:resolve-local-track-urls', async (_, payload) => {
 
       const existingAudioUrl = String(item?.audioUrl || '').trim()
       if (/^file:\/\//i.test(existingAudioUrl)) {
-        resolved[id] = existingAudioUrl
-        continue
+        try {
+          const filePath = fileURLToPath(existingAudioUrl)
+          if (fs.existsSync(filePath)) {
+            const localMediaUrl = await toLocalMediaUrl(filePath)
+            if (localMediaUrl) {
+              resolved[id] = localMediaUrl
+              continue
+            }
+          }
+        } catch {
+          // ignore invalid file URL
+        }
       }
 
       const rawFileName = String(item?.fileName || '').trim()
@@ -1982,8 +4644,13 @@ ipcMain.handle('library:resolve-local-track-urls', async (_, payload) => {
       }
 
       const localPath = path.join(libraryDir, fileName)
-      if (fs.existsSync(localPath)) {
-        resolved[id] = pathToFileURL(localPath).href
+      const legacyPath = path.join(app.getPath('appData'), 'Electron', 'library-audio', fileName)
+      const finalPath = fs.existsSync(localPath) ? localPath : fs.existsSync(legacyPath) ? legacyPath : ''
+      if (finalPath) {
+        const localMediaUrl = await toLocalMediaUrl(finalPath)
+        if (localMediaUrl) {
+          resolved[id] = localMediaUrl
+        }
       }
     }
 
@@ -1993,6 +4660,61 @@ ipcMain.handle('library:resolve-local-track-urls', async (_, payload) => {
       ok: false,
       reason: String(error?.message || error || 'resolve-local-track-urls-failed'),
     }
+  }
+})
+
+ipcMain.handle('library:delete-local-track-file', async (_, payload) => {
+  try {
+    const fileNameRaw = String(payload?.fileName || '').trim()
+    const audioUrlRaw = String(payload?.audioUrl || '').trim()
+    const safeFileName = path.basename(fileNameRaw)
+    const candidates = []
+
+    if (audioUrlRaw) {
+      if (/^file:\/\//i.test(audioUrlRaw)) {
+        try {
+          candidates.push(fileURLToPath(audioUrlRaw))
+        } catch {
+          // ignore invalid file urls
+        }
+      } else {
+        try {
+          const parsed = new URL(audioUrlRaw)
+          const localMediaPrefix = '/local-media/'
+          if (parsed.pathname.startsWith(localMediaPrefix)) {
+            const token = parsed.pathname.slice(localMediaPrefix.length)
+            const decoded = Buffer.from(token, 'base64url').toString('utf8')
+            if (decoded) candidates.push(decoded)
+          }
+        } catch {
+          // ignore non-url values
+        }
+      }
+    }
+
+    if (safeFileName && safeFileName !== '.' && safeFileName !== '..') {
+      candidates.push(path.join(app.getPath('userData'), 'library-audio', safeFileName))
+      candidates.push(path.join(app.getPath('appData'), 'Electron', 'library-audio', safeFileName))
+    }
+
+    const tried = []
+    let deleted = false
+    for (const candidate of candidates) {
+      const normalized = path.resolve(String(candidate || ''))
+      if (!normalized || tried.includes(normalized)) continue
+      tried.push(normalized)
+      if (!fs.existsSync(normalized)) continue
+      try {
+        fs.unlinkSync(normalized)
+        deleted = true
+      } catch {
+        // try next candidate
+      }
+    }
+
+    return { ok: true, deleted, tried }
+  } catch (error) {
+    return { ok: false, reason: String(error?.message || error || 'delete-local-track-file-failed') }
   }
 })
 
@@ -2036,7 +4758,7 @@ const createWindow = async () => {
     show: false,
     center: true,
     backgroundColor: '#0a1119',
-    title: isAdminMode ? 'Ghxsty Manifest Studio' : 'Music',
+    title: 'GLITCH Music',
     icon: getLogoPath(),
     frame: false,
     autoHideMenuBar: true,
@@ -2044,6 +4766,7 @@ const createWindow = async () => {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      partition: 'persist:ghxsty-music',
       // Arka plandayken renderer döngülerini kısarak CPU/RAM kullanımını düşür.
       backgroundThrottling: true,
     },
@@ -2064,10 +4787,36 @@ const createWindow = async () => {
   mainWindow.on('leave-full-screen', syncWindowLayoutState)
   mainWindow.on('resize', syncWindowLayoutState)
 
+  const syncRuntimeFrameRate = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return
+    }
+    const isForeground = mainWindow.isVisible() && mainWindow.isFocused() && !mainWindow.isMinimized()
+    const lowCoreDevice = CPU_CORE_COUNT <= 4
+    try {
+      // Düşük çekirdekli cihazlarda foreground FPS'i bir miktar kısıp
+      // arka planda çok daha agresif düşürerek CPU kullanımını azalt.
+      if (isForeground) {
+        mainWindow.webContents.setFrameRate(lowCoreDevice ? 45 : 60)
+      } else {
+        mainWindow.webContents.setFrameRate(1)
+      }
+    } catch {
+      // ignore unsupported platforms/builds
+    }
+  }
+  mainWindow.on('show', syncRuntimeFrameRate)
+  mainWindow.on('hide', syncRuntimeFrameRate)
+  mainWindow.on('focus', syncRuntimeFrameRate)
+  mainWindow.on('blur', syncRuntimeFrameRate)
+  mainWindow.on('minimize', syncRuntimeFrameRate)
+  mainWindow.on('restore', syncRuntimeFrameRate)
+  syncRuntimeFrameRate()
+
 
 
   mainWindow.on('close', (event) => {
-    if (isQuitting || isAdminMode || closeBehavior === 'quit') {
+    if (isQuitting || closeBehavior === 'quit') {
       return
     }
 
@@ -2083,6 +4832,14 @@ const createWindow = async () => {
   mainWindow.webContents.on('did-finish-load', () => {
     console.log('Main window loaded')
     emitWindowLayoutState()
+    if (pendingDeepLinkPayload) {
+      mainWindow?.webContents.send('app:deep-link', pendingDeepLinkPayload)
+    }
+  })
+
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    const label = level === 3 ? 'ERROR' : level === 2 ? 'WARN' : 'LOG'
+    console.log(`[Renderer ${label}] ${sourceId || 'unknown'}:${line || 0} -> ${message}`)
   })
 
   mainWindow.webContents.on('did-fail-load', (_, code, description, validatedURL) => {
@@ -2114,14 +4871,21 @@ const createWindow = async () => {
 
   try {
     if (process.env.VITE_DEV_SERVER_URL) {
-      const targetUrl = new URL(isAdminMode ? '/admin.html' : '/', process.env.VITE_DEV_SERVER_URL)
+      const targetUrl = new URL('/', process.env.VITE_DEV_SERVER_URL)
       await mainWindow.loadURL(targetUrl.href)
     } else {
-      await mainWindow.loadFile(path.join(__dirname, '..', 'build', isAdminMode ? 'admin.html' : 'index.html'))
+      await loadRendererFromBuild(mainWindow, 'index.html')
     }
   } catch (error) {
     console.error('Window load failed:', error)
-    await mainWindow.loadURL('data:text/html;charset=utf-8,<html><body style="background:#0a1119;color:white;font-family:sans-serif;padding:24px;">Uygulama yuklenemedi. Terminal ciktisini kontrol et.</body></html>')
+    const win = mainWindow
+    if (win && !win.isDestroyed()) {
+      try {
+        await win.loadURL('data:text/html;charset=utf-8,<html><body style="background:#0a1119;color:white;font-family:sans-serif;padding:24px;">Uygulama yuklenemedi. Terminal ciktisini kontrol et.</body></html>')
+      } catch (fallbackError) {
+        console.error('Window fallback load failed:', fallbackError)
+      }
+    }
   }
 
   if (!mainWindow.isDestroyed()) {
@@ -2132,14 +4896,14 @@ const createWindow = async () => {
 
 const createAppTray = () => {
   tray = new Tray(createTrayIcon())
-  tray.setToolTip('Music')
+  tray.setToolTip('GLITCH Music')
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: 'Göster', click: () => mainWindow?.show() },
-      { label: 'Gizle', click: () => mainWindow?.hide() },
+      { label: 'Show', click: () => mainWindow?.show() },
+      { label: 'Hide', click: () => mainWindow?.hide() },
       { type: 'separator' },
       {
-        label: 'Çıkış',
+        label: 'Quit',
         click: () => {
           isQuitting = true
           app.quit()
@@ -2153,14 +4917,62 @@ const createAppTray = () => {
   })
 }
 
+const ensureDependenciesInstalled = async () => {
+  if (process.platform !== 'win32') {
+    return { ok: true, reason: 'non-windows' }
+  }
+
+  const checkCommand = (cmd) => {
+    try {
+      const result = spawnSync('where', [cmd], { stdio: 'ignore', timeout: 3000 })
+      return result.status === 0
+    } catch {
+      return false
+    }
+  }
+
+  const missingDeps = []
+  if (!checkCommand('yt-dlp')) missingDeps.push('yt-dlp')
+  if (!checkCommand('ffmpeg')) missingDeps.push('ffmpeg')
+
+  if (!missingDeps.length) {
+    return { ok: true, reason: 'all-installed' }
+  }
+  // UI uyarısı renderer tarafında modal olarak gösterilir.
+  return { ok: false, reason: 'missing-deps', missing: missingDeps }
+}
+
 app.whenReady().then(async () => {
-  await setupDiscordRichPresence().catch(() => {})
+  migrateLegacyUserDataIfNeeded()
+
+  try {
+    // Dev modda (npm start/electron .) protocol kaydı bazen yanlış argv ile
+    // System32 gibi hatalı path'lere yazılabiliyor. Sadece paketli uygulamada kaydet.
+    if (app.isPackaged) {
+      app.setAsDefaultProtocolClient(APP_PROTOCOL)
+    }
+  } catch {
+    // ignore protocol registration failures
+  }
+
+  const startupDeepLink = extractDeepLinkFromArgv(process.argv)
+  if (startupDeepLink) {
+    dispatchDeepLinkPayload(parseDeepLinkPayload(startupDeepLink))
+  }
+
   await createWindow()
   createAppTray()
+  syncLaunchOnStartupSetting()
   registerMediaShortcuts()
   setupAutoUpdater()
   resetUpdaterState()
   scheduleUpdateChecks()
+
+  // Açılışta UI bloklanmasın: ağır başlangıç işleri arka plana alınır.
+  setTimeout(() => {
+    ensureDependenciesInstalled().catch(() => {})
+    setupDiscordRichPresence().catch(() => {})
+  }, 60)
 
   app.on('activate', async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -2175,7 +4987,7 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
-  if (closeBehavior === 'quit' || isAdminMode) {
+  if (closeBehavior === 'quit') {
     app.quit()
   }
 })
@@ -2192,5 +5004,12 @@ app.on('before-quit', () => {
     globalShortcut.unregisterAll()
   } catch {
     // ignore global shortcut cleanup issues
+  }
+  try {
+    if (rendererServer) {
+      rendererServer.close()
+    }
+  } catch {
+    // ignore
   }
 })

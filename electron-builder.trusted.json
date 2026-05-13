@@ -1,0 +1,47 @@
+{
+  "appId": "com.ghxsty.music",
+  "productName": "Ghxsty Music",
+  "executableName": "Ghxsty Music",
+  "artifactName": "Ghxsty-Music-Setup-${version}.${ext}",
+  "compression": "normal",
+  "asar": true,
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "build/**/*",
+    "electron/**/*",
+    "!electron/ytmusic_bridge.py",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "electron/ytmusic_bridge.py",
+      "to": "bin/ytmusic_bridge.py"
+    }
+  ],
+  "win": {
+    "target": [
+      "nsis"
+    ],
+    "icon": "public/logo.ico",
+    "cscLink": "C:\\Users\\kivan\\code-cert.pfx",
+    "cscKeyPassword": "50181985!"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "installerIcon": "public/logo.ico",
+    "uninstallerIcon": "public/logo.ico",
+    "installerHeaderIcon": "public/logo.ico"
+  },
+  "publish": {
+    "provider": "github",
+    "owner": "ghxsty-dev",
+    "repo": "glitch-music",
+    "releaseType": "release",
+    "publishAutoUpdate": true
+  }
+}
