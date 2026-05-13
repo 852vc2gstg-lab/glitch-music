@@ -7,6 +7,12 @@
 
 <img src="https://github.com/ghxsty-dev/glitch-music/blob/main/.github/Ads%C4%B1z%20tasar%C4%B1m(4).png?raw=true&" width="900" />
 
+<p align="center">
+  <img src="https://img.shields.io/github/downloads/ghxsty-dev/glitch-music/total?style=for-the-badge">
+  <img src="https://img.shields.io/github/stars/ghxsty-dev/glitch-music?style=for-the-badge">
+  <img src="https://img.shields.io/github/license/ghxsty-dev/glitch-music?style=for-the-badge">
+</p>
+
 ---
 
 ## Installation
