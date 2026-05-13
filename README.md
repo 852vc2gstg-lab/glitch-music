@@ -48,4 +48,10 @@ winget install yt-dlp
 
 - If you encounter a bug or would like to contact us, you can join our Discord server by [clicking here](https://discord.gg/m9HNRRD4j4).
 
+<p align="center">
+  <a href="https://discord.gg/HKXRTySDhv">
+    <img src="https://cdn-icons-png.flaticon.com/512/5968/5968756.png" width="80" alt="Discord" />
+  </a>
+</p>
+
 ---
