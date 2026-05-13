@@ -7,7 +7,6 @@ What truly sets GLITCH Music apart from other players is its ecosystem-like expe
 <img src="https://github.com/ghxsty-dev/glitch-music/blob/main/.github/Ads%C4%B1z%20tasar%C4%B1m(4).png?raw=true&" width="900" />
 Installation
 
-
 - After downloading the application from GLITCH Music Setup, follow the installer instructions. If any required modules are missing, use the commands below:
 
 
@@ -17,6 +16,12 @@ Installation
 # Linux
 
 ```bashComing soon```
+
+# Photos in App
+
+<img src="https://github.com/ghxsty-dev/glitch-music/blob/main/.github/Ekran%20g%C3%B6r%C3%BCnt%C3%BCs%C3%BC%202026-05-13%20172615.png?raw=true&" width="400" />
+<img src="https://github.com/ghxsty-dev/glitch-music/blob/main/.github/Ekran%20g%C3%B6r%C3%BCnt%C3%BCs%C3%BC%202026-05-13%20172629.png?raw=true&" width="400" />
+<img src="https://github.com/ghxsty-dev/glitch-music/blob/main/.github/Ekran%20g%C3%B6r%C3%BCnt%C3%BCs%C3%BC%202026-05-13%20172638.png?raw=true&" width="400" />
 
 # How to Use
 
