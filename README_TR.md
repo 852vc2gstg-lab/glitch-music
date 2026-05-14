@@ -6,7 +6,7 @@
 
 * GLITCH Music’i diğer oynatıcılardan gerçekten ayıran şey ise ekosistem benzeri deneyimidir. Discord Rich Presence entegrasyonu, gelişmiş uygulama içi indirme ve aktarım sistemleri, aylık dinleme özetleri ve istatistikleri, çevrimdışı öncelikli tasarım anlayışı ve kişiselleştirilmiş öneri/keşif sistemleri sayesinde sadece bir müzik oynatıcı olmaktan çok daha fazlasını sunar. Müzik deneyiminizi düzenlemenize, keşfetmenize ve tamamen kişiselleştirmenize yardımcı olan kapsamlı bir uygulamadır.
 
-* İngilizce README.md için buraya tıklayın.
+* İngilizce README.md için [buraya tıklayın.](https://github.com/ghxsty-dev/glitch-music/blob/main/README.md)
 
 <img src="https://github.com/ghxsty-dev/glitch-music/blob/main/.github/Ads%C4%B1z%20tasar%C4%B1m(4).png?raw=true&" width="900" />
 
