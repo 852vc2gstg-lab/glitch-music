@@ -1,5 +1,3 @@
-# GLITCH Music
-
 <img src="https://github.com/ghxsty-dev/glitch-music/blob/main/.github/GLITCHyazi%20(800%20x%20200%20piksel).png?raw=true&" width="1200" />
 
 * GLITCH Music, klasik bir müzik oynatıcıdan çok daha fazlasıdır — tam anlamıyla kişisel bir müzik merkezi gibi çalışır. Yerel müzik kütüphanesini, YouTube Music arama ve indirme özelliklerini, oynatma listesi yönetimini, gelişmiş modern bir oynatıcıyı, senkronize şarkı sözlerini ve sanatçı/albüm keşfini tek bir uygulamada bir araya getirir. Ayrıca tema seçenekleri, şeffaflık modları, performans ayarları, kısayollar ve davranış tercihleri gibi geniş özelleştirme seçenekleri sunar; tüm bunlar akıcı ve masaüstü odaklı bir arayüz ile birleşir.
