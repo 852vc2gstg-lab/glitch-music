@@ -5,6 +5,8 @@
 
 - What truly sets GLITCH Music apart from other players is its ecosystem-like experience. Features such as Discord Rich Presence integration, advanced in-app downloading and transfer workflows, monthly listening summaries and statistics, an offline-first design philosophy, and personalized recommendation/discovery systems make it much more than just a music player. It’s an app that helps you organize, discover, and personalize your entire music experience.
 
+- For Turkish README.md click here.
+
 <img src="https://github.com/ghxsty-dev/glitch-music/blob/main/.github/Ads%C4%B1z%20tasar%C4%B1m(4).png?raw=true&" width="900" />
 
 <p align="center">
